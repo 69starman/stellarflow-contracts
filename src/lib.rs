@@ -243,6 +243,12 @@ pub enum ContractError {
     RescueProposalNotPending = 77,
     /// Mandatory timelock delay has not expired yet.
     RescueTimelockNotExpired = 78,
+    /// Emergency override mechanism is disabled.
+    EmergencyOverrideDisabled = 79,
+    /// Caller is not an authorized emergency signer.
+    NotEmergencySigner = 80,
+    /// Emergency override vote threshold not yet reached.
+    OverrideThresholdNotReached = 81,
 }
 
 impl ContractError {
@@ -582,14 +588,52 @@ impl TimeLockedUpgradeContract {
         Ok(amount)
     }
 
-    /// Credit direct voting weight into a staker's balance map.
+    /// Stake governance tokens, automatically deriving voting weight from the stake.
     ///
-    /// This seeds the source balance a staker later moves when delegating
-    /// voting power to a delegate.
-    pub fn set_voting_weight(env: Env, staker: Address, amount: u128) -> Result<(), ContractError> {
+    /// This is the primary entrypoint for acquiring voting power. It stakes
+    /// governance tokens and automatically updates the staker's direct voting
+    /// weight based on the configured conversion rate.
+    pub fn stake_governance(env: Env, staker: Address, amount: u128) -> Result<u128, ContractError> {
         staker.require_auth();
-        crate::voting_delegation::set_voting_weight(&env, &staker, amount);
-        Ok(())
+        admin::assert_not_revoked(&env, &staker)?;
+        crate::voting_delegation::stake_governance(&env, &staker, amount)
+    }
+
+    /// Unstake governance tokens, automatically reducing voting weight.
+    pub fn unstake_governance(env: Env, staker: Address, amount: u128) -> Result<u128, ContractError> {
+        staker.require_auth();
+        admin::assert_not_revoked(&env, &staker)?;
+        crate::voting_delegation::unstake_governance(&env, &staker, amount)
+    }
+
+    /// Sync voting weight with current governance stake.
+    pub fn sync_voting_weight(env: Env, staker: Address) -> Result<u128, ContractError> {
+        staker.require_auth();
+        crate::voting_delegation::sync_voting_weight(&env, &staker)
+    }
+
+    /// Get the governance stake balance for a staker.
+    pub fn get_governance_stake(env: Env, staker: Address) -> u128 {
+        crate::voting_delegation::get_governance_stake(&env, &staker)
+    }
+
+    /// Get the current governance weight derivation configuration.
+    pub fn get_gov_weight_config(env: Env) -> crate::voting_delegation::GovWeightConfig {
+        crate::voting_delegation::get_gov_weight_config(&env)
+    }
+
+    /// Set the governance weight derivation configuration (Admin only).
+    pub fn set_gov_weight_config(
+        env: Env,
+        admin: Address,
+        config: crate::voting_delegation::GovWeightConfig,
+    ) -> Result<(), ContractError> {
+        let data = Self::get_data(env.clone())?;
+        if data.admin != admin {
+            return Err(ContractError::NotAdmin);
+        }
+        admin.require_auth();
+        crate::voting_delegation::set_gov_weight_config(&env, &admin, config)
     }
 
     /// Delegate the caller's entire direct voting weight to `delegate`.
@@ -1563,6 +1607,65 @@ impl TimeLockedUpgradeContract {
     /// Check if a proposal has been vetoed.
     pub fn is_proposal_vetoed(env: Env, proposal_id: u64) -> bool {
         veto::is_proposal_vetoed(&env, proposal_id)
+    }
+
+    // ── Emergency Timelock Override (Issue #2) ──────────────────────────────────
+
+    /// Set the emergency signers and threshold for timelock override (Admin only).
+    ///
+    /// Only the contract admin may configure the emergency override parameters.
+    pub fn set_emergency_override_config(
+        env: Env,
+        caller: Address,
+        emergency_signers: Vec<Address>,
+        threshold_bps: u32,
+        enabled: bool,
+    ) -> Result<(), ContractError> {
+        veto::set_emergency_override_config(&env, caller, emergency_signers, threshold_bps, enabled)
+    }
+
+    /// Get the current emergency override configuration.
+    pub fn get_emergency_override_config(env: Env) -> veto::EmergencyOverrideConfig {
+        veto::get_emergency_override_config(&env)
+    }
+
+    /// Vote for an emergency timelock override on a pending upgrade proposal.
+    ///
+    /// Emergency signers may vote to bypass the timelock delay and execute
+    /// the upgrade immediately. Once the threshold is reached, the upgrade
+    /// can be executed via `execute_emergency_override`.
+    pub fn vote_emergency_override(
+        env: Env,
+        signer: Address,
+        proposal_id: u64,
+        reason: soroban_sdk::String,
+    ) -> Result<(), ContractError> {
+        veto::vote_emergency_override(&env, signer, proposal_id, reason)
+    }
+
+    /// Execute an emergency timelock override, immediately deploying the pending upgrade.
+    ///
+    /// Can only be called after the emergency override threshold has been reached
+    /// via `vote_emergency_override`. Bypasses the normal timelock delay.
+    pub fn execute_emergency_override(
+        env: Env,
+        executor: Address,
+        proposal_id: u64,
+    ) -> Result<veto::EmergencyOverrideResult, ContractError> {
+        veto::execute_emergency_override(&env, executor, proposal_id)
+    }
+
+    /// Check if emergency override threshold has been reached for a proposal.
+    pub fn is_emergency_override_ready(env: Env, proposal_id: u64) -> bool {
+        veto::is_emergency_override_ready(&env, proposal_id)
+    }
+
+    /// Get the emergency override votes for a proposal.
+    pub fn get_emergency_override_votes(
+        env: Env,
+        proposal_id: u64,
+    ) -> Map<Address, veto::EmergencyOverrideVote> {
+        veto::get_emergency_override_votes(&env, proposal_id)
     }
 
     // ── Timelocked Protocol Treasury Emergency Rescue Handler (Issue #783) ───
