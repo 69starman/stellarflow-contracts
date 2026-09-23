@@ -4,12 +4,6 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, Map, Symbol, Vec,
 };
 
-#![no_std]
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
-    Map, Symbol, Vec,
-};
-
 /// Numeric asset identifier for gas-optimized storage.
 /// Replaces heavy Symbol identifiers in high-frequency paths.
 pub type AssetId = u32;
@@ -243,6 +237,16 @@ pub enum ContractError {
     RescueProposalNotPending = 77,
     /// Mandatory timelock delay has not expired yet.
     RescueTimelockNotExpired = 78,
+    /// A swap was requested with a zero input amount.
+    ZeroSwapAmount = 79,
+    /// No liquidity pool is registered for the requested asset pair / the
+    /// requested route could not be satisfied by any registered pool.
+    PoolNotFound = 80,
+    /// A route hop failed during execution (missing pool, broken link, etc.).
+    RouteExecutionFailed = 81,
+    /// A constant-product invariant check failed: `k_new < k_old` after a swap
+    /// or the aggregate path product decreased across intermediate pools.
+    InvariantViolation = 82,
 }
 
 impl ContractError {
@@ -2028,6 +2032,71 @@ impl TimeLockedUpgradeContract {
         slippage_tolerance_bps: u32,
     ) -> Result<router::multihop::SimulatedSwapOutcome, ContractError> {
         router::multihop::simulate_route(&env, &route, slippage_tolerance_bps)
+    }
+
+    // ── Dynamic AMM swap routing (Issue #926) ───────────────────────────────
+
+    /// Register or refresh a constant-product AMM pool edge available to the
+    /// dynamic router. Admin-only.
+    pub fn register_amm_pool(
+        env: Env, admin: Address, edge: router::dynamic::PoolEdge,
+    ) -> Result<(), ContractError> {
+        router::dynamic::register_pool(&env, admin, edge)
+    }
+
+    /// Remove a pool edge from the dynamic router registry. Admin-only.
+    pub fn remove_amm_pool(
+        env: Env, admin: Address, pool: Address,
+    ) -> Result<(), ContractError> {
+        router::dynamic::remove_pool(&env, admin, pool)
+    }
+
+    pub fn get_amm_pool(env: Env, pool: Address) -> Option<router::dynamic::PoolEdge> {
+        router::dynamic::get_pool(&env, pool)
+    }
+
+    pub fn get_amm_pools(env: Env) -> Vec<router::dynamic::PoolEdge> {
+        router::dynamic::registered_pool_edges(&env)
+    }
+
+    /// Update the dynamic router's hop depth / price-impact ceiling / kill
+    /// switch. Admin-only.
+    pub fn set_swap_router_config(
+        env: Env, admin: Address, config: router::dynamic::RouterConfig,
+    ) -> Result<(), ContractError> {
+        router::dynamic::set_router_config(&env, admin, config)
+    }
+
+    pub fn get_swap_router_config(env: Env) -> router::dynamic::RouterConfig {
+        router::dynamic::get_router_config(&env)
+    }
+
+    /// Quote the best token swap path up to `max_hops` deep (max 3) across the
+    /// registered AMM pools without mutating state.
+    pub fn quote_best_swap_route(
+        env: Env, source: AssetId, destination: AssetId, amount_in: u64, max_hops: u32,
+    ) -> Result<router::dynamic::RouteQuote, ContractError> {
+        router::dynamic::quote_route(&env, source, destination, amount_in, max_hops)
+    }
+
+    /// Execute a dynamically-routed single- or multi-hop swap.
+    ///
+    /// Enforces the caller's balance-delta floor (`B_out >= B_min_expected`),
+    /// the aggregate path invariant (`k₁ · k₂ · k₃ >= k_initial`), and the
+    /// effective-price tolerance, reverting with
+    /// [`ContractError::SlippageExceeded`] when either guard trips.
+    pub fn execute_dynamic_swap(
+        env: Env,
+        trader: Address,
+        source: AssetId,
+        destination: AssetId,
+        amount_in: u64,
+        min_amount_out: u64,
+        max_price_impact_bps: u32,
+    ) -> Result<router::dynamic::RouteQuote, ContractError> {
+        router::dynamic::execute_swap(
+            &env, trader, source, destination, amount_in, min_amount_out, max_price_impact_bps,
+        )
     }
 
     // ── Wrapped cross-chain asset mint/burn controls (Issue #692) ───────────
