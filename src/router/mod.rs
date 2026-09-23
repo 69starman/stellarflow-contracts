@@ -1,3 +1,6 @@
+pub mod dynamic;
+pub mod multihop;
+
 use soroban_sdk::{contract, contractimpl, Env, Symbol, Address};
 
 #[contract]
