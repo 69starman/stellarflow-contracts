@@ -95,6 +95,9 @@ pub const EV_HTLC_REFUND: Symbol = symbol_short!("htlc_ref");
 /// Router: a multi-hop route executed successfully.
 pub const EV_ROUTE_OK: Symbol = symbol_short!("route_ok");
 
+/// Liquidity provider alert triggered when spread imbalance exceeds threshold.
+pub const EV_LIQUIDITY_PROVIDER_ALERT: Symbol = symbol_short!("lp_alert");
+
 /// Admin: a coordinator was added.
 pub const EV_COORD_ADDED: Symbol = symbol_short!("coord_add");
 
