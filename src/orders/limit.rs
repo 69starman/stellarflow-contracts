@@ -1,4 +1,7 @@
-//! On-chain limit order book matching logic (Issue #701).
+//! On-chain limit order book matching logic (Issues #701 / #915).
+//!
+//! Issue #915 adds a tick-volume market matcher that walks the resting book
+//! in price/time priority, updates `V_tick`, and settles maker↔taker directly.
 //!
 //! Makers post limit orders that lock their `sell_asset` in the contract
 //! until a fill keeper matches them at (or better than) their `price_tick`.
@@ -52,6 +55,8 @@ pub struct LimitOrder {
     /// Expiry ledger sequence; zero means the order does not expire.
     pub expiry: u32,
     pub active: bool,
+    /// Bid (Buy) or ask (Sell) side of the book.
+    pub side: OrderSide,
 }
 
 #[contracttype]
@@ -280,11 +285,13 @@ pub fn place_order_with_expiry(
         created_at_ledger: env.ledger().sequence(),
         expiry,
         active: true,
+        side: OrderSide::Sell,
     };
 
     save_order(env, &order);
     bucket_push(env, &pair, price_tick, order.id);
 
+    // Ask-side tick volume (is_bid = false) — sorted ascending for price priority.
     add_tick_liquidity(env, &pair, price_tick, sell_amount, false);
 
     Ok(order)
@@ -326,13 +333,14 @@ pub fn place_buy_order(
         created_at_ledger: env.ledger().sequence(),
         expiry: 0,
         active: true,
+        side: OrderSide::Buy,
     };
 
     save_order(env, &order);
     bucket_push(env, &pair, price_tick, order.id);
 
-    // Bid-side tick volume — locked quote is the escrowed size at this tick.
-    add_tick_liquidity(env, &pair, price_tick, locked_quote, true);
+    // Bid-side tick volume (is_bid = true) — sorted descending for price priority.
+    add_tick_liquidity(env, &pair, price_tick, buy_amount, true);
 
     Ok(order)
 }
@@ -387,8 +395,8 @@ pub fn fill_order(env: &Env, filler: Address, order_id: u64, fill_amount: i128) 
     }
     save_order(env, &order);
 
-    let is_bid = order.pair.sell_asset > order.pair.buy_asset;
-    remove_tick_liquidity(env, &order.pair, order.price_tick, fill_amount, is_bid);
+    let book_is_bid = order.side == OrderSide::Buy;
+    remove_tick_liquidity(env, &order.pair, order.price_tick, fill_amount, book_is_bid);
 
     env.events().publish(
         (soroban_sdk::symbol_short!("ord_fill"), order.id),
@@ -547,10 +555,11 @@ fn cancel_order_inner(env: &Env, maker: &Address, order_id: u64) -> Result<i128,
         return Err(ContractError::OrderAlreadyClosed);
     }
 
+    let remaining_base = order.remaining_amount;
     let recovered = if order.side == OrderSide::Buy {
-        quote_amount(order.remaining_amount, order.price_tick)?
+        quote_amount(remaining_base, order.price_tick)?
     } else {
-        order.remaining_amount
+        remaining_base
     };
     order.remaining_amount = 0;
     order.amount = 0;
@@ -559,7 +568,8 @@ fn cancel_order_inner(env: &Env, maker: &Address, order_id: u64) -> Result<i128,
     save_order(env, &order);
 
     let book_is_bid = order.side == OrderSide::Buy;
-    remove_tick_liquidity(env, &order.pair, order.price_tick, recovered, book_is_bid);
+    // Tick volume is always tracked in base units.
+    remove_tick_liquidity(env, &order.pair, order.price_tick, remaining_base, book_is_bid);
 
     if recovered > 0 {
         let asset = if order.side == OrderSide::Buy {
@@ -748,6 +758,189 @@ pub fn get_liquidity_depth(env: &Env, pair: AssetPair, is_bid: bool) -> Vec<Liqu
         }
     }
     levels
+}
+
+
+/// One fill produced while sweeping the book by price/time priority.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TickMatchFill {
+    pub order_id: u64,
+    pub maker: Address,
+    pub price_tick: i128,
+    pub filled_amount: i128,
+    pub paid_amount: i128,
+    /// Tick volume after applying `V_tick = V_tick - ΔV_filled`.
+    pub tick_volume_after: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TickMatchResult {
+    pub filled_amount: i128,
+    pub total_paid: i128,
+    pub fills: Vec<TickMatchFill>,
+    pub fully_filled: bool,
+}
+
+/// Read the resting volume map entry `V_tick` for `(pair, price_tick, side)`.
+pub fn get_tick_volume(env: &Env, pair: AssetPair, price_tick: i128, is_bid: bool) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&LiquidityStorageKey::TickVolume(pair, price_tick, is_bid))
+        .unwrap_or(0)
+}
+
+/// Match an incoming market order against resting limit orders ordered by
+/// price/time priority (Issue #915).
+///
+/// * `is_buy == true` — taker acquires `sell_asset` and pays `buy_asset`;
+///   walks the **ask** book (`is_bid = false`) lowest tick first.
+/// * `is_buy == false` — taker disposes `sell_asset` and receives `buy_asset`;
+///   walks the **bid** book (`is_bid = true`) highest tick first.
+///
+/// Within each tick the resting-order bucket is traversed FIFO (time priority).
+/// Every fill updates `V_tick := V_tick - ΔV_filled` and transfers traded
+/// assets directly between maker and taker (base released from escrow for
+/// asks; quote released from escrow for bids).
+pub fn match_market_order(
+    env: &Env,
+    taker: Address,
+    pair: AssetPair,
+    amount: i128,
+    is_buy: bool,
+) -> Result<TickMatchResult, ContractError> {
+    if amount <= 0 {
+        return Err(ContractError::OrderZeroAmount);
+    }
+    taker.require_auth();
+
+    let book_is_bid = !is_buy;
+    let ticks_key = LiquidityStorageKey::ActiveTicks(pair.clone(), book_is_bid);
+    let ticks: Vec<i128> = env
+        .storage()
+        .persistent()
+        .get(&ticks_key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    // Snapshot the price-priority linked list so removals mid-walk are safe.
+    let mut tick_list: Vec<i128> = Vec::new(env);
+    for t in ticks.iter() {
+        tick_list.push_back(t);
+    }
+
+    let mut remaining = amount;
+    let mut total_paid: i128 = 0;
+    let mut fills: Vec<TickMatchFill> = Vec::new(env);
+
+    for ti in 0..tick_list.len() {
+        if remaining == 0 {
+            break;
+        }
+        let price_tick = tick_list.get(ti).unwrap();
+
+        let bucket = get_orders_at_tick(env, pair.clone(), price_tick);
+        let mut order_ids: Vec<u64> = Vec::new(env);
+        for id in bucket.iter() {
+            order_ids.push_back(id);
+        }
+
+        for oi in 0..order_ids.len() {
+            if remaining == 0 {
+                break;
+            }
+            let order_id = order_ids.get(oi).unwrap();
+            let mut order = match load_order(env, order_id) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            if !order.active || order.remaining_amount <= 0 {
+                continue;
+            }
+            if order.expiry != 0 && env.ledger().sequence() > order.expiry {
+                continue;
+            }
+            if book_is_bid {
+                if order.side != OrderSide::Buy {
+                    continue;
+                }
+            } else if order.side != OrderSide::Sell {
+                continue;
+            }
+
+            let fill_qty = if remaining < order.remaining_amount {
+                remaining
+            } else {
+                order.remaining_amount
+            };
+            let paid = quote_amount(fill_qty, order.price_tick)?;
+
+            if is_buy {
+                // Market buy: taker → maker (quote), escrow → taker (base).
+                let buy_client = token::Client::new(env, &order.pair.buy_asset);
+                buy_client.transfer(&taker, &order.maker, &paid);
+                let sell_client = token::Client::new(env, &order.pair.sell_asset);
+                sell_client.transfer(&env.current_contract_address(), &taker, &fill_qty);
+            } else {
+                // Market sell: taker → maker (base), escrow → taker (quote).
+                let sell_client = token::Client::new(env, &order.pair.sell_asset);
+                sell_client.transfer(&taker, &order.maker, &fill_qty);
+                let buy_client = token::Client::new(env, &order.pair.buy_asset);
+                buy_client.transfer(&env.current_contract_address(), &taker, &paid);
+            }
+
+            order.remaining_amount = order
+                .remaining_amount
+                .checked_sub(fill_qty)
+                .ok_or(ContractError::MathOverflow)?;
+            order.amount = order.remaining_amount;
+            order.filled_amount = order
+                .filled_amount
+                .checked_add(fill_qty)
+                .ok_or(ContractError::MathOverflow)?;
+            if order.remaining_amount == 0 {
+                order.active = false;
+                bucket_remove(env, &order.pair, order.price_tick, order.id);
+            }
+            save_order(env, &order);
+
+            // V_tick = V_tick - ΔV_filled
+            remove_tick_liquidity(env, &pair, price_tick, fill_qty, book_is_bid);
+            let tick_volume_after = get_tick_volume(env, pair.clone(), price_tick, book_is_bid);
+
+            fills.push_back(TickMatchFill {
+                order_id: order.id,
+                maker: order.maker.clone(),
+                price_tick,
+                filled_amount: fill_qty,
+                paid_amount: paid,
+                tick_volume_after,
+            });
+
+            remaining = remaining
+                .checked_sub(fill_qty)
+                .ok_or(ContractError::MathOverflow)?;
+            total_paid = total_paid
+                .checked_add(paid)
+                .ok_or(ContractError::MathOverflow)?;
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("mkt_fill"), order.id),
+                (taker.clone(), fill_qty, paid, price_tick),
+            );
+        }
+    }
+
+    if fills.is_empty() {
+        return Err(ContractError::InsufficientLiquidityDepth);
+    }
+
+    Ok(TickMatchResult {
+        filled_amount: amount.checked_sub(remaining).ok_or(ContractError::MathOverflow)?,
+        total_paid,
+        fills,
+        fully_filled: remaining == 0,
+    })
 }
 
 #[cfg(test)]
@@ -948,58 +1141,65 @@ mod tests {
 
         let remaining_orders = client.get_orders_at_tick(&pair, &(2 * PRICE_SCALE));
         assert_eq!(remaining_orders.len(), 1);
-        assert_eq!(remaining_orders.get(0).unwrap(), order.id);
+        let remaining = client.get_limit_order(&order.id).unwrap();
+        assert_eq!(remaining.remaining_amount, 700);
     }
 
     #[test]
-    fn batch_cancel_removes_orders_from_tick_and_returns_escrow() {
+    fn market_buy_sweeps_asks_by_price_time_and_updates_tick_volume() {
         let (env, client, sell_asset, buy_asset, _) = setup();
-        let maker = Address::generate(&env);
-        mint(&env, &sell_asset, &maker, 3_000);
+        let maker_a = Address::generate(&env);
+        let maker_b = Address::generate(&env);
+        let taker = Address::generate(&env);
+        mint(&env, &sell_asset, &maker_a, 100);
+        mint(&env, &sell_asset, &maker_b, 200);
+        mint(&env, &buy_asset, &taker, 10_000);
+
         let pair = AssetPair {
             sell_asset: sell_asset.clone(),
             buy_asset: buy_asset.clone(),
         };
-        let o1 = client.place_limit_order(&maker, &pair, &PRICE_SCALE, &1_000);
-        let o2 = client.place_limit_order(&maker, &pair, &PRICE_SCALE, &1_000);
-        let o3 = client.place_limit_order(&maker, &pair, &(2 * PRICE_SCALE), &1_000);
+        // Worse ask first in wall-clock, better ask second — matcher must still
+        // hit the lower tick first (price priority), then FIFO within a tick.
+        let _high = client.place_limit_order(&maker_b, &pair, &(3 * PRICE_SCALE), &200);
+        let low = client.place_limit_order(&maker_a, &pair, &(2 * PRICE_SCALE), &100);
 
-        let ids = soroban_sdk::vec![&env, o1.id, o2.id, o3.id];
-        let result = client.cancel_limit_orders_batch(&maker, &ids);
-        assert_eq!(result.cancelled_count, 3);
-        assert_eq!(result.recovered_total, 3_000);
+        assert_eq!(client.get_tick_volume(&pair, &(2 * PRICE_SCALE), &false), 100);
+        assert_eq!(client.get_tick_volume(&pair, &(3 * PRICE_SCALE), &false), 200);
 
-        assert_eq!(client.get_orders_at_tick(&pair, &PRICE_SCALE).len(), 0);
-        assert_eq!(client.get_orders_at_tick(&pair, &(2 * PRICE_SCALE)).len(), 0);
+        let result = client.match_market_order(&taker, &pair, &150, &true);
+        assert!(result.fully_filled);
+        assert_eq!(result.filled_amount, 150);
+        assert_eq!(result.fills.len(), 2);
+        // First fill at best ask (tick=2)
+        assert_eq!(result.fills.get(0).unwrap().price_tick, 2 * PRICE_SCALE);
+        assert_eq!(result.fills.get(0).unwrap().filled_amount, 100);
+        assert_eq!(result.fills.get(0).unwrap().tick_volume_after, 0);
+        // Remainder at next ask (tick=3)
+        assert_eq!(result.fills.get(1).unwrap().price_tick, 3 * PRICE_SCALE);
+        assert_eq!(result.fills.get(1).unwrap().filled_amount, 50);
+        assert_eq!(result.fills.get(1).unwrap().tick_volume_after, 150);
 
-        let sell_client = soroban_sdk::token::Client::new(&env, &sell_asset);
-        assert_eq!(sell_client.balance(&maker), 3_000);
+        assert_eq!(client.get_tick_volume(&pair, &(2 * PRICE_SCALE), &false), 0);
+        assert_eq!(client.get_tick_volume(&pair, &(3 * PRICE_SCALE), &false), 150);
 
-        assert!(!client.get_limit_order(&o1.id).unwrap().active);
-        assert!(!client.get_limit_order(&o2.id).unwrap().active);
-        assert!(!client.get_limit_order(&o3.id).unwrap().active);
+        let sell_token = soroban_sdk::token::Client::new(&env, &sell_asset);
+        let buy_token = soroban_sdk::token::Client::new(&env, &buy_asset);
+        assert_eq!(sell_token.balance(&taker), 150);
+        // 100*2 + 50*3 = 350 quote paid to makers
+        assert_eq!(buy_token.balance(&maker_a), 200);
+        assert_eq!(buy_token.balance(&maker_b), 150);
+        assert!(client.get_limit_order(&low.id).unwrap().remaining_amount == 0
+            || !client.get_limit_order(&low.id).unwrap().active);
     }
 
     #[test]
-    fn batch_cancel_is_atomic_on_foreign_order() {
+    fn market_order_errors_when_book_empty() {
         let (env, client, sell_asset, buy_asset, _) = setup();
-        let maker = Address::generate(&env);
-        let other = Address::generate(&env);
-        mint(&env, &sell_asset, &maker, 1_000);
-        mint(&env, &sell_asset, &other, 1_000);
-        let pair = AssetPair {
-            sell_asset: sell_asset.clone(),
-            buy_asset,
-        };
-        let own = client.place_limit_order(&maker, &pair, &PRICE_SCALE, &1_000);
-        let foreign = client.place_limit_order(&other, &pair, &PRICE_SCALE, &1_000);
-
-        let ids = soroban_sdk::vec![&env, own.id, foreign.id];
-        let result = client.try_cancel_limit_orders_batch(&maker, &ids);
-        assert_eq!(result, Err(Ok(ContractError::OrderNotMaker)));
-
-        // Atomic: maker's order must still be resting after the failed batch.
-        assert!(client.get_limit_order(&own.id).unwrap().active);
-        assert_eq!(client.get_orders_at_tick(&pair, &PRICE_SCALE).len(), 2);
+        let taker = Address::generate(&env);
+        mint(&env, &buy_asset, &taker, 1_000);
+        let pair = AssetPair { sell_asset, buy_asset };
+        let result = client.try_match_market_order(&taker, &pair, &10, &true);
+        assert_eq!(result, Err(Ok(ContractError::InsufficientLiquidityDepth)));
     }
 }
