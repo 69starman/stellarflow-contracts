@@ -13,6 +13,7 @@ pub enum DataKey {
     ProviderWeight(Address),
     VoteDelegate(Address),
     IsPaused,
+    Revoked(Address),
     ActiveRelayers,
     CommunityCouncil,
     EmergencyFrozen,
@@ -26,10 +27,41 @@ pub enum DataKey {
     ProposedAction(u64),
     /// Stores the list of voters for a proposed multi-sig action.
     ActionVotes(u64),
+    /// Stores affirmative and negative voter addresses separately.
+    ActionAffirmativeVotes(u64),
+    ActionNegativeVotes(u64),
+    /// Stores weighted totals for each side of a proposal.
+    ActionAffirmativeWeight(u64),
+    ActionNegativeWeight(u64),
+    /// Stores the snapshot weight recorded for a voter on a proposal.
+    ActionVoteWeight(u64, Address),
+    /// veFLOW lock contract used to read proposal-time voting power.
+    VeflowLockContract,
+    /// Circulating veFLOW supply used for quorum calculations.
+    VeflowCirculatingSupply,
     /// Maps an admin address to their ephemeral submission delegate.
     SubmissionDelegate(Address),
     /// Maps a delegate address back to the admin who authorized it.
     DelegateOf(Address),
+
+    // ── Circuit-Breaker ───────────────────────────────────────────────────────
+    /// Registered coordinator nodes that may trigger the circuit-breaker.
+    /// Value: Vec<Address>.
+    CircuitBreakerCoordinators,
+    /// Global circuit-breaker flag.  When true, every price query for a
+    /// high-volatility asset is dropped immediately.
+    CircuitBreakerActive,
+    /// Ledger timestamp at which the circuit-breaker was last tripped.
+    CircuitBreakerTrippedAt,
+    /// Address of the coordinator that last tripped the circuit-breaker.
+    CircuitBreakerTrippedBy,
+    /// Per-asset circuit-breaker override flag (Symbol → bool).
+    /// When true the asset is individually paused regardless of the global flag.
+    CircuitBreakerPairedAsset(soroban_sdk::Symbol),
+    /// Stores the current WASM code hash of the contract
+    CurrentWasmHash,
+    /// Stores the previous WASM code hash for rollback capabilities
+    PreviousWasmHash,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -52,12 +84,47 @@ pub fn _has_admin(env: &Env) -> bool {
 }
 
 /// Check if a caller is in the authorized admin list.
+///
+/// Loads the admin list onto a fixed-size stack slice and scans linearly —
+/// no heap-allocated map is created inside the auth loop, reducing gas on
+/// routine multi-signature verification paths (closes #528).
 pub fn _is_authorized(env: &Env, caller: &Address) -> bool {
-    env.storage()
+    if _is_revoked(env, caller) {
+        return false;
+    }
+
+    let admins = env
+        .storage()
         .instance()
         .get::<DataKey, Vec<Address>>(&DataKey::Admin)
-        .map(|admins| admins.iter().any(|admin| admin == *caller))
-        .unwrap_or(false)
+        .unwrap_or_else(|| Vec::new(env));
+
+    // Stack-local fixed buffer — avoids any BTreeMap / HashMap heap allocation.
+    const CAP: usize = 16;
+    let mut buf: [Option<Address>; CAP] = [
+        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
+    ];
+    let len = (admins.len() as usize).min(CAP);
+    for i in 0..len {
+        buf[i] = Some(admins.get(i as u32).unwrap());
+    }
+
+    for i in 0..len {
+        if buf[i].as_ref() == Some(caller) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn _require_auth_for_args<T: soroban_sdk::IntoVal>(
+    env: &Env,
+    caller: &Address,
+    args: &[T],
+) {
+    caller.require_auth_for_args(args);
+    let _ = env;
 }
 
 pub fn _require_authorized(env: &Env, caller: &Address) {
@@ -68,6 +135,10 @@ pub fn _require_authorized(env: &Env, caller: &Address) {
 
 /// Add an address to the authorized admin list.
 pub fn _add_authorized(env: &Env, new_admin: &Address) {
+    if _is_revoked(env, new_admin) {
+        return;
+    }
+
     let mut admins = _get_admin(env);
     // Avoid duplicates
     if !admins.iter().any(|admin| admin == *new_admin) {
@@ -78,6 +149,10 @@ pub fn _add_authorized(env: &Env, new_admin: &Address) {
 
 /// Remove an address from the authorized admin list.
 pub fn _remove_authorized(env: &Env, admin_to_remove: &Address) {
+    if !_has_admin(env) {
+        return;
+    }
+
     let admins = _get_admin(env);
     let original_len = admins.len();
 
@@ -171,11 +246,47 @@ pub fn _remove_paused(env: &Env) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Revocation Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn _is_revoked(env: &Env, addr: &Address) -> bool {
+    env.storage()
+        .instance()
+        .get::<DataKey, bool>(&DataKey::Revoked(addr.clone()))
+        .unwrap_or(false)
+}
+
+pub fn _set_revoked(env: &Env, addr: &Address, revoked: bool) {
+    if revoked {
+        env.storage().instance().set(&DataKey::Revoked(addr.clone()), &true);
+    } else {
+        env.storage().instance().remove(&DataKey::Revoked(addr.clone()));
+    }
+}
+
+pub fn _revoke_key(env: &Env, addr: &Address) -> bool {
+    if _is_revoked(env, addr) {
+        return false;
+    }
+
+    _set_revoked(env, addr, true);
+    if _has_admin(env) {
+        _remove_authorized(env, addr);
+    }
+    _remove_provider(env, addr);
+    true
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Provider Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Whitelist a provider address.
 pub fn _add_provider(env: &Env, provider: &Address) {
+    if _is_revoked(env, provider) {
+        return;
+    }
+
     env.storage()
         .instance()
         .set(&DataKey::Provider(provider.clone()), &true);
@@ -204,6 +315,10 @@ pub fn _remove_provider(env: &Env, provider: &Address) {
 
 /// Returns `true` if the address is a whitelisted provider OR an authorized delegate.
 pub fn _is_provider(env: &Env, addr: &Address) -> bool {
+    if _is_revoked(env, addr) {
+        return false;
+    }
+
     // 1. Direct provider whitelist check
     if env
         .storage()
@@ -230,6 +345,10 @@ pub fn _require_provider(env: &Env, caller: &Address) {
 }
 
 pub fn _set_provider_weight(env: &Env, provider: &Address, weight: u32) {
+    if _is_revoked(env, provider) {
+        return;
+    }
+
     env.storage()
         .instance()
         .set(&DataKey::ProviderWeight(provider.clone()), &weight);
@@ -933,16 +1052,8 @@ mod auth_tests {
             _set_vote_delegate(&env, &admin, &delegate1);
             assert_eq!(_get_vote_delegate(&env, &admin), Some(delegate1));
 
-        let events = env.events().all();
-        assert!(!events.events().is_empty());
-    }
-
-    #[test]
-    fn test_set_admin_emits_event_on_admin_change() {
-        let (env, contract_id, _old_admin) = setup();
-        let new_admin = Address::generate(&env);
-
-            assert_eq!(_add_effective_action_votes(&env, 1, &admin2), 2);
+            _set_vote_delegate(&env, &admin, &delegate2);
+            assert_eq!(_get_vote_delegate(&env, &admin), Some(delegate2));
         });
     }
 
@@ -959,9 +1070,5 @@ mod auth_tests {
 
             assert!(!_has_admin(&env));
         });
-    }
-
-        let events = env.events().all();
-        assert!(events.events().len() >= 2);
     }
 }

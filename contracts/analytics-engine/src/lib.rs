@@ -1,6 +1,10 @@
 #![no_std]
 
+mod math;
+
 use soroban_sdk::{contract, contractimpl, contracttype, Env};
+
+use crate::math::compute_smoothed_value;
 
 /// Compact 4-byte asset identifier replacing verbose Symbol keys for storage.
 #[contracttype]
@@ -13,7 +17,7 @@ const ALPHA_SCALE: i128 = 10_000;
 #[contracttype]
 pub enum DataKey {
     EmaRecord(AssetId), // Maps an asset id to its EMA
-    Alpha,             // The smoothing factor
+    Alpha,              // The smoothing factor
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,13 +48,16 @@ impl AnalyticsEngine {
         if price <= 0 {
             panic!("price must be positive");
         }
-        
-        let alpha: i128 = env.storage().instance().get(&DataKey::Alpha).unwrap_or_else(|| panic!("not initialized"));
+
+        let alpha: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Alpha)
+            .unwrap_or_else(|| panic!("not initialized"));
         let key = DataKey::EmaRecord(asset);
-        
+
         let new_ema = if let Some(record) = env.storage().persistent().get::<_, EmaRecord>(&key) {
-            // Calculate new EMA: (Price * alpha + Old_EMA * (1 - alpha))
-            (price * alpha + record.value * (ALPHA_SCALE - alpha)) / ALPHA_SCALE
+            compute_smoothed_value(price, record.value, alpha)
         } else {
             // First price submission becomes the initial EMA
             price

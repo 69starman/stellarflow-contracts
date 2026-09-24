@@ -25,6 +25,8 @@ pub enum DataKey {
     PendingAdminTimestamp,
     AdminUpdateTimestamp,
     RecentEvents,
+    /// Mapping of relayer address -> accumulated reward balance
+    Rewards,
     Initialized,
     /// TWAP Buffer: Stores last 10 (Timestamp, Price) updates.
     Twap(Symbol),
@@ -143,6 +145,8 @@ pub enum DataKey {
     /// price and the consensus median.  Written on every `report_price_deviation`
     /// call for audit and off-chain indexing purposes.
     ProviderLastDeviationBps(Address),
+    /// Gas Tank escrow contract address for relayer reimbursement (Issue #266).
+    GasTank,
 }
 
 /// Decimal metadata for an asset pair.

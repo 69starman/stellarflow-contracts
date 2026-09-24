@@ -1,0 +1,8 @@
+[target.'cfg(target_arch = "wasm32")']
+rustflags = ["-C", "link-arg=-z", "-C", "link-arg=stack-size=16384"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-L", "C:/Users/olani/OneDrive/Desktop/drips/stellarflow-contracts/lib_dummy"]
+
+[host]
+rustflags = ["-L", "C:/Users/olani/OneDrive/Desktop/drips/stellarflow-contracts/lib_dummy"]
