@@ -9,7 +9,7 @@
 //! order itself — and the maker can cancel a still-open order at any time to
 //! recover whatever quantity has not yet been filled.
 
-use soroban_sdk::{contracttype, token, Address, Env, Vec};
+use soroban_sdk::{contracttype, token, Address, Env, Symbol, Vec};
 
 use crate::ContractError;
 
@@ -28,6 +28,13 @@ pub struct AssetPair {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OrderSide {
+    Sell,
+    Buy,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct LimitOrder {
     pub id: u64,
@@ -35,6 +42,8 @@ pub struct LimitOrder {
     pub pair: AssetPair,
     pub sell_asset: Address,
     pub buy_asset: Address,
+    /// Bid (Buy) or ask (Sell) side of the book.
+    pub side: OrderSide,
     /// Price in `buy_asset` per unit of `sell_asset`, fixed-point at `PRICE_SCALE`.
     pub price_tick: i128,
     /// Remaining sell-asset collateral locked by this order.
@@ -48,13 +57,6 @@ pub struct LimitOrder {
     pub active: bool,
     /// Bid (Buy) or ask (Sell) side of the book.
     pub side: OrderSide,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OrderSide {
-    Sell,
-    Buy,
 }
 
 #[contracttype]
@@ -91,6 +93,16 @@ pub struct SettlementResult {
     pub base_fee_amount: i128,
     pub seller_order_closed: bool,
     pub buyer_order_closed: bool,
+}
+
+/// Result of atomically cancelling a batch of resting limit orders.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchCancelResult {
+    /// Number of orders successfully cancelled in this transaction.
+    pub cancelled_count: u32,
+    /// Aggregate escrow balance returned to the maker across all cancels.
+    pub recovered_total: i128,
 }
 
 #[contracttype]
@@ -264,6 +276,7 @@ pub fn place_order_with_expiry(
         pair: pair.clone(),
         sell_asset: pair.sell_asset.clone(),
         buy_asset: pair.buy_asset.clone(),
+        side: OrderSide::Sell,
         price_tick,
         amount: sell_amount,
         original_amount: sell_amount,
@@ -311,6 +324,7 @@ pub fn place_buy_order(
         pair: pair.clone(),
         sell_asset: pair.sell_asset.clone(),
         buy_asset: pair.buy_asset.clone(),
+        side: OrderSide::Buy,
         price_tick,
         amount: buy_amount,
         original_amount: buy_amount,
@@ -528,9 +542,13 @@ pub fn match_orders(
 /// Callable by the maker at any time — no expiry or keeper approval needed.
 pub fn cancel_order(env: &Env, maker: Address, order_id: u64) -> Result<i128, ContractError> {
     maker.require_auth();
+    cancel_order_inner(env, &maker, order_id)
+}
 
+/// Internal cancel helper used by single and batch entrypoints (auth already checked).
+fn cancel_order_inner(env: &Env, maker: &Address, order_id: u64) -> Result<i128, ContractError> {
     let mut order = load_order(env, order_id)?;
-    if order.maker != maker {
+    if order.maker != *maker {
         return Err(ContractError::OrderNotMaker);
     }
     if !order.active {
@@ -560,10 +578,48 @@ pub fn cancel_order(env: &Env, maker: Address, order_id: u64) -> Result<i128, Co
             order.pair.sell_asset.clone()
         };
         let token_client = token::Client::new(env, &asset);
-        token_client.transfer(&env.current_contract_address(), &maker, &recovered);
+        token_client.transfer(&env.current_contract_address(), maker, &recovered);
     }
 
     Ok(recovered)
+}
+
+/// Atomically cancel multiple resting limit orders in a single transaction
+/// (Issue #939).
+///
+/// Processes `order_ids = [id_1, id_2, ... id_n]` for `maker`: each order is
+/// removed from its price-tick bucket (linked-list index) and its remaining
+/// escrowed balance is returned. On success emits `OrdersCancelledInBatch`
+/// with the count of processed orders. Any failure reverts the whole batch.
+pub fn cancel_orders_batch(
+    env: &Env,
+    maker: Address,
+    order_ids: Vec<u64>,
+) -> Result<BatchCancelResult, ContractError> {
+    maker.require_auth();
+
+    let mut cancelled_count: u32 = 0;
+    let mut recovered_total: i128 = 0;
+
+    for order_id in order_ids.iter() {
+        let recovered = cancel_order_inner(env, &maker, order_id)?;
+        recovered_total = recovered_total
+            .checked_add(recovered)
+            .ok_or(ContractError::MathOverflow)?;
+        cancelled_count = cancelled_count
+            .checked_add(1)
+            .ok_or(ContractError::Overflow)?;
+    }
+
+    env.events().publish(
+        (Symbol::new(env, "OrdersCancelledInBatch"), maker.clone()),
+        cancelled_count,
+    );
+
+    Ok(BatchCancelResult {
+        cancelled_count,
+        recovered_total,
+    })
 }
 
 pub fn get_balance(env: &Env, owner: Address, asset: Address) -> i128 {

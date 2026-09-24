@@ -1989,6 +1989,18 @@ impl TimeLockedUpgradeContract {
         )
     }
 
+    /// Post a buy-side limit order that locks quote escrow at `price_tick`.
+    pub fn place_buy_limit_order(
+        env: Env,
+        maker: Address,
+        pair: orders::limit::AssetPair,
+        price_tick: i128,
+        buy_amount: i128,
+    ) -> Result<orders::limit::LimitOrder, ContractError> {
+        let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
+        orders::limit::place_buy_order(&env, maker, pair, price_tick, buy_amount)
+    }
+
     pub fn fill_limit_order(
         env: Env, filler: Address, order_id: u64, fill_amount: i128,
     ) -> Result<orders::limit::FillResult, ContractError> {
@@ -2008,6 +2020,20 @@ impl TimeLockedUpgradeContract {
         let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
         maker.require_auth();
         orders::limit::cancel_order(&env, maker, order_id)
+    }
+
+    /// Batch-cancel resting limit orders in a single atomic transaction (Issue #939).
+    ///
+    /// Processes `order_ids` for `maker`, removes each from its price-tick bucket,
+    /// returns locked escrow balances, and emits `OrdersCancelledInBatch` with the
+    /// count of processed orders.
+    pub fn cancel_limit_orders_batch(
+        env: Env,
+        maker: Address,
+        order_ids: Vec<u64>,
+    ) -> Result<orders::limit::BatchCancelResult, ContractError> {
+        let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
+        orders::limit::cancel_orders_batch(&env, maker, order_ids)
     }
 
     pub fn get_limit_order(env: Env, order_id: u64) -> Option<orders::limit::LimitOrder> {
