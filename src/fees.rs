@@ -11,6 +11,7 @@ pub const STANDARD_FIXED_POINT_SCALE: i128 = 10_000_000;
 pub const INTERIOR_FEE_PRECISION_SCALE: i128 = 100_000_000_000_000;
 pub const DYNAMIC_FEE_SCALE: u64 = 10_000_000;
 pub const MIN_DYNAMIC_FEE: u64 = 5_000;
+pub const LP_FEE_GROWTH_SCALE: i128 = INTERIOR_FEE_PRECISION_SCALE;
 
 // ---------------------------------------------------------------------------
 // Asset pricing storage (general — unchanged)
@@ -68,6 +69,79 @@ pub struct DynamicFeeAccumulator {
     pub current_fee: u64,
     pub lambda: u64,
     pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlashLoanFeeGrowth {
+    pub fee_growth_accumulator: i128,
+}
+
+impl FlashLoanFeeGrowth {
+    pub fn new() -> Self {
+        Self {
+            fee_growth_accumulator: 0,
+        }
+    }
+}
+
+/// Settles flash-loan fees against active LP shares and advances `f_acc`.
+/// The final allocation receives integer-rounding dust so no fee is stranded.
+pub fn settle_flash_loan_fee(
+    growth: &mut FlashLoanFeeGrowth,
+    flash_fee: u64,
+    lp_shares: Vec<u64>,
+) -> Result<Vec<u64>, ContractError> {
+    let total_lp = lp_shares.iter().try_fold(0_i128, |total, share| {
+        total
+            .checked_add(*share as i128)
+            .ok_or(ContractError::Overflow)
+    })?;
+    if total_lp <= 0 || lp_shares.len() == 0 {
+        return Err(ContractError::DivisionByZero);
+    }
+
+    let fee = flash_fee as i128;
+    let fee_growth = fee
+        .checked_mul(LP_FEE_GROWTH_SCALE)
+        .ok_or(ContractError::Overflow)?
+        .checked_div(total_lp)
+        .ok_or(ContractError::DivisionByZero)?;
+    growth.fee_growth_accumulator = growth
+        .fee_growth_accumulator
+        .checked_add(fee_growth)
+        .ok_or(ContractError::Overflow)?;
+
+    let mut allocations = Vec::new(lp_shares.env());
+    let mut allocated = 0_u64;
+    let last_index = lp_shares.len() - 1;
+    for index in 0..lp_shares.len() {
+        let allocation = if index == last_index {
+            flash_fee
+                .checked_sub(allocated)
+                .ok_or(ContractError::Overflow)?
+        } else {
+            let share = lp_shares
+                .get(index)
+                .ok_or(ContractError::Overflow)? as i128;
+            fee
+                .checked_mul(share)
+                .ok_or(ContractError::Overflow)?
+                .checked_div(total_lp)
+                .ok_or(ContractError::DivisionByZero)?
+                .try_into()
+                .map_err(|_| ContractError::Overflow)?
+        };
+        allocated = allocated
+            .checked_add(allocation)
+            .ok_or(ContractError::Overflow)?;
+        allocations.push_back(allocation);
+    }
+
+    if allocated != flash_fee {
+        return Err(ContractError::Overflow);
+    }
+    Ok(allocations)
 }
 
 pub fn calculate_decayed_fee(
@@ -359,5 +433,49 @@ mod tests {
             3 * DYNAMIC_FEE_SCALE
         );
         assert_eq!(accumulator.peak_fee, 3 * DYNAMIC_FEE_SCALE);
+    }
+
+    #[test]
+    fn flash_loan_fee_growth_updates_and_reconciles() {
+        let env = Env::default();
+        let mut shares = Vec::new(&env);
+        shares.push_back(1);
+        shares.push_back(3);
+        let mut growth = FlashLoanFeeGrowth::new();
+
+        let allocations = settle_flash_loan_fee(&mut growth, 10, shares).unwrap();
+
+        assert_eq!(allocations.get(0), Some(2));
+        assert_eq!(allocations.get(1), Some(8));
+        assert_eq!(growth.fee_growth_accumulator, 10 * LP_FEE_GROWTH_SCALE / 4);
+    }
+
+    #[test]
+    fn flash_loan_fee_growth_preserves_rounding_dust() {
+        let env = Env::default();
+        let mut shares = Vec::new(&env);
+        shares.push_back(1);
+        shares.push_back(1);
+        shares.push_back(1);
+        let mut growth = FlashLoanFeeGrowth::new();
+
+        let allocations = settle_flash_loan_fee(&mut growth, 10, shares).unwrap();
+
+        assert_eq!(allocations.get(0), Some(3));
+        assert_eq!(allocations.get(1), Some(3));
+        assert_eq!(allocations.get(2), Some(4));
+        assert_eq!(allocations.iter().fold(0_u64, |total, fee| total + fee), 10);
+    }
+
+    #[test]
+    fn flash_loan_fee_growth_rejects_empty_lp_supply() {
+        let env = Env::default();
+        let shares = Vec::new(&env);
+        let mut growth = FlashLoanFeeGrowth::new();
+
+        assert_eq!(
+            settle_flash_loan_fee(&mut growth, 10, shares),
+            Err(ContractError::DivisionByZero)
+        );
     }
 }
