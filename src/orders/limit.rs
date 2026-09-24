@@ -6,7 +6,7 @@
 //! order itself — and the maker can cancel a still-open order at any time to
 //! recover whatever quantity has not yet been filled.
 
-use soroban_sdk::{contracttype, token, Address, Env, Vec};
+use soroban_sdk::{contracttype, token, Address, Env, Symbol, Vec};
 
 use crate::ContractError;
 
@@ -25,6 +25,13 @@ pub struct AssetPair {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OrderSide {
+    Sell,
+    Buy,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct LimitOrder {
     pub id: u64,
@@ -32,6 +39,8 @@ pub struct LimitOrder {
     pub pair: AssetPair,
     pub sell_asset: Address,
     pub buy_asset: Address,
+    /// Bid (Buy) or ask (Sell) side of the book.
+    pub side: OrderSide,
     /// Price in `buy_asset` per unit of `sell_asset`, fixed-point at `PRICE_SCALE`.
     pub price_tick: i128,
     /// Remaining sell-asset collateral locked by this order.
@@ -43,13 +52,6 @@ pub struct LimitOrder {
     /// Expiry ledger sequence; zero means the order does not expire.
     pub expiry: u32,
     pub active: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OrderSide {
-    Sell,
-    Buy,
 }
 
 #[contracttype]
@@ -86,6 +88,16 @@ pub struct SettlementResult {
     pub base_fee_amount: i128,
     pub seller_order_closed: bool,
     pub buyer_order_closed: bool,
+}
+
+/// Result of atomically cancelling a batch of resting limit orders.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchCancelResult {
+    /// Number of orders successfully cancelled in this transaction.
+    pub cancelled_count: u32,
+    /// Aggregate escrow balance returned to the maker across all cancels.
+    pub recovered_total: i128,
 }
 
 #[contracttype]
@@ -259,6 +271,7 @@ pub fn place_order_with_expiry(
         pair: pair.clone(),
         sell_asset: pair.sell_asset.clone(),
         buy_asset: pair.buy_asset.clone(),
+        side: OrderSide::Sell,
         price_tick,
         amount: sell_amount,
         original_amount: sell_amount,
@@ -272,8 +285,7 @@ pub fn place_order_with_expiry(
     save_order(env, &order);
     bucket_push(env, &pair, price_tick, order.id);
 
-    let is_bid = pair.sell_asset > pair.buy_asset;
-    add_tick_liquidity(env, &pair, price_tick, sell_amount, is_bid);
+    add_tick_liquidity(env, &pair, price_tick, sell_amount, false);
 
     Ok(order)
 }
@@ -305,6 +317,7 @@ pub fn place_buy_order(
         pair: pair.clone(),
         sell_asset: pair.sell_asset.clone(),
         buy_asset: pair.buy_asset.clone(),
+        side: OrderSide::Buy,
         price_tick,
         amount: buy_amount,
         original_amount: buy_amount,
@@ -317,6 +330,9 @@ pub fn place_buy_order(
 
     save_order(env, &order);
     bucket_push(env, &pair, price_tick, order.id);
+
+    // Bid-side tick volume — locked quote is the escrowed size at this tick.
+    add_tick_liquidity(env, &pair, price_tick, locked_quote, true);
 
     Ok(order)
 }
@@ -518,9 +534,13 @@ pub fn match_orders(
 /// Callable by the maker at any time — no expiry or keeper approval needed.
 pub fn cancel_order(env: &Env, maker: Address, order_id: u64) -> Result<i128, ContractError> {
     maker.require_auth();
+    cancel_order_inner(env, &maker, order_id)
+}
 
+/// Internal cancel helper used by single and batch entrypoints (auth already checked).
+fn cancel_order_inner(env: &Env, maker: &Address, order_id: u64) -> Result<i128, ContractError> {
     let mut order = load_order(env, order_id)?;
-    if order.maker != maker {
+    if order.maker != *maker {
         return Err(ContractError::OrderNotMaker);
     }
     if !order.active {
@@ -538,8 +558,8 @@ pub fn cancel_order(env: &Env, maker: Address, order_id: u64) -> Result<i128, Co
     bucket_remove(env, &order.pair, order.price_tick, order.id);
     save_order(env, &order);
 
-    let is_bid = order.pair.sell_asset > order.pair.buy_asset;
-    remove_tick_liquidity(env, &order.pair, order.price_tick, recovered, is_bid);
+    let book_is_bid = order.side == OrderSide::Buy;
+    remove_tick_liquidity(env, &order.pair, order.price_tick, recovered, book_is_bid);
 
     if recovered > 0 {
         let asset = if order.side == OrderSide::Buy {
@@ -548,10 +568,48 @@ pub fn cancel_order(env: &Env, maker: Address, order_id: u64) -> Result<i128, Co
             order.pair.sell_asset.clone()
         };
         let token_client = token::Client::new(env, &asset);
-        token_client.transfer(&env.current_contract_address(), &maker, &recovered);
+        token_client.transfer(&env.current_contract_address(), maker, &recovered);
     }
 
     Ok(recovered)
+}
+
+/// Atomically cancel multiple resting limit orders in a single transaction
+/// (Issue #939).
+///
+/// Processes `order_ids = [id_1, id_2, ... id_n]` for `maker`: each order is
+/// removed from its price-tick bucket (linked-list index) and its remaining
+/// escrowed balance is returned. On success emits `OrdersCancelledInBatch`
+/// with the count of processed orders. Any failure reverts the whole batch.
+pub fn cancel_orders_batch(
+    env: &Env,
+    maker: Address,
+    order_ids: Vec<u64>,
+) -> Result<BatchCancelResult, ContractError> {
+    maker.require_auth();
+
+    let mut cancelled_count: u32 = 0;
+    let mut recovered_total: i128 = 0;
+
+    for order_id in order_ids.iter() {
+        let recovered = cancel_order_inner(env, &maker, order_id)?;
+        recovered_total = recovered_total
+            .checked_add(recovered)
+            .ok_or(ContractError::MathOverflow)?;
+        cancelled_count = cancelled_count
+            .checked_add(1)
+            .ok_or(ContractError::Overflow)?;
+    }
+
+    env.events().publish(
+        (Symbol::new(env, "OrdersCancelledInBatch"), maker.clone()),
+        cancelled_count,
+    );
+
+    Ok(BatchCancelResult {
+        cancelled_count,
+        recovered_total,
+    })
 }
 
 pub fn get_balance(env: &Env, owner: Address, asset: Address) -> i128 {
@@ -890,6 +948,58 @@ mod tests {
 
         let remaining_orders = client.get_orders_at_tick(&pair, &(2 * PRICE_SCALE));
         assert_eq!(remaining_orders.len(), 1);
-        assert_eq!(remaining_orders.get(0).unwrap().remaining_amount, 700);
+        assert_eq!(remaining_orders.get(0).unwrap(), order.id);
+    }
+
+    #[test]
+    fn batch_cancel_removes_orders_from_tick_and_returns_escrow() {
+        let (env, client, sell_asset, buy_asset, _) = setup();
+        let maker = Address::generate(&env);
+        mint(&env, &sell_asset, &maker, 3_000);
+        let pair = AssetPair {
+            sell_asset: sell_asset.clone(),
+            buy_asset: buy_asset.clone(),
+        };
+        let o1 = client.place_limit_order(&maker, &pair, &PRICE_SCALE, &1_000);
+        let o2 = client.place_limit_order(&maker, &pair, &PRICE_SCALE, &1_000);
+        let o3 = client.place_limit_order(&maker, &pair, &(2 * PRICE_SCALE), &1_000);
+
+        let ids = soroban_sdk::vec![&env, o1.id, o2.id, o3.id];
+        let result = client.cancel_limit_orders_batch(&maker, &ids);
+        assert_eq!(result.cancelled_count, 3);
+        assert_eq!(result.recovered_total, 3_000);
+
+        assert_eq!(client.get_orders_at_tick(&pair, &PRICE_SCALE).len(), 0);
+        assert_eq!(client.get_orders_at_tick(&pair, &(2 * PRICE_SCALE)).len(), 0);
+
+        let sell_client = soroban_sdk::token::Client::new(&env, &sell_asset);
+        assert_eq!(sell_client.balance(&maker), 3_000);
+
+        assert!(!client.get_limit_order(&o1.id).unwrap().active);
+        assert!(!client.get_limit_order(&o2.id).unwrap().active);
+        assert!(!client.get_limit_order(&o3.id).unwrap().active);
+    }
+
+    #[test]
+    fn batch_cancel_is_atomic_on_foreign_order() {
+        let (env, client, sell_asset, buy_asset, _) = setup();
+        let maker = Address::generate(&env);
+        let other = Address::generate(&env);
+        mint(&env, &sell_asset, &maker, 1_000);
+        mint(&env, &sell_asset, &other, 1_000);
+        let pair = AssetPair {
+            sell_asset: sell_asset.clone(),
+            buy_asset,
+        };
+        let own = client.place_limit_order(&maker, &pair, &PRICE_SCALE, &1_000);
+        let foreign = client.place_limit_order(&other, &pair, &PRICE_SCALE, &1_000);
+
+        let ids = soroban_sdk::vec![&env, own.id, foreign.id];
+        let result = client.try_cancel_limit_orders_batch(&maker, &ids);
+        assert_eq!(result, Err(Ok(ContractError::OrderNotMaker)));
+
+        // Atomic: maker's order must still be resting after the failed batch.
+        assert!(client.get_limit_order(&own.id).unwrap().active);
+        assert_eq!(client.get_orders_at_tick(&pair, &PRICE_SCALE).len(), 2);
     }
 }
