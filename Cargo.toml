@@ -43,6 +43,7 @@ soroban-token-sdk = { version = "=20.0.0", default-features = false }
 soroban-sdk = { version = "=20.0.0", default-features = false }
 soroban-token-sdk = { version = "=20.0.0", default-features = false }
 ledger-time-helper = { path = "contracts/ledger-time-helper" }
+libm = "0.2.16"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 soroban-sdk = { version = "=20.0.0", default-features = false, features = ["testutils"] }

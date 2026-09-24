@@ -9,6 +9,9 @@ use soroban_sdk::{contracttype, Address, Env, Vec};
 
 pub const STANDARD_FIXED_POINT_SCALE: i128 = 10_000_000;
 pub const INTERIOR_FEE_PRECISION_SCALE: i128 = 100_000_000_000_000;
+pub const DYNAMIC_FEE_SCALE: u64 = 10_000_000;
+pub const MIN_DYNAMIC_FEE: u64 = 5_000;
+pub const LP_FEE_GROWTH_SCALE: i128 = INTERIOR_FEE_PRECISION_SCALE;
 
 /// Supported pool fee tiers in basis points: 0.05%, 0.30%, and 1.00%.
 pub const FEE_TIER_5_BPS: u32 = 5;
@@ -226,6 +229,137 @@ pub struct CorridorWeightProfile {
     pub asset: AssetId,
     pub base_weight: u64,
     pub dynamic_weight: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DynamicFeeAccumulator {
+    pub base_fee: u64,
+    pub peak_fee: u64,
+    pub current_fee: u64,
+    pub lambda: u64,
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlashLoanFeeGrowth {
+    pub fee_growth_accumulator: i128,
+}
+
+impl FlashLoanFeeGrowth {
+    pub fn new() -> Self {
+        Self {
+            fee_growth_accumulator: 0,
+        }
+    }
+}
+
+/// Settles flash-loan fees against active LP shares and advances `f_acc`.
+/// The final allocation receives integer-rounding dust so no fee is stranded.
+pub fn settle_flash_loan_fee(
+    growth: &mut FlashLoanFeeGrowth,
+    flash_fee: u64,
+    lp_shares: Vec<u64>,
+) -> Result<Vec<u64>, ContractError> {
+    let total_lp = lp_shares.iter().try_fold(0_i128, |total, share| {
+        total
+            .checked_add(share as i128)
+            .ok_or(ContractError::Overflow)
+    })?;
+    if total_lp <= 0 || lp_shares.len() == 0 {
+        return Err(ContractError::DivisionByZero);
+    }
+
+    let fee = flash_fee as i128;
+    let fee_growth = fee
+        .checked_mul(LP_FEE_GROWTH_SCALE)
+        .ok_or(ContractError::Overflow)?
+        .checked_div(total_lp)
+        .ok_or(ContractError::DivisionByZero)?;
+    growth.fee_growth_accumulator = growth
+        .fee_growth_accumulator
+        .checked_add(fee_growth)
+        .ok_or(ContractError::Overflow)?;
+
+    let mut allocations = Vec::new(lp_shares.env());
+    let mut allocated = 0_u64;
+    let last_index = lp_shares.len() - 1;
+    for index in 0..lp_shares.len() {
+        let allocation = if index == last_index {
+            flash_fee
+                .checked_sub(allocated)
+                .ok_or(ContractError::Overflow)?
+        } else {
+            let share = lp_shares
+                .get(index)
+                .ok_or(ContractError::Overflow)? as i128;
+            fee
+                .checked_mul(share)
+                .ok_or(ContractError::Overflow)?
+                .checked_div(total_lp)
+                .ok_or(ContractError::DivisionByZero)?
+                .try_into()
+                .map_err(|_| ContractError::Overflow)?
+        };
+        allocated = allocated
+            .checked_add(allocation)
+            .ok_or(ContractError::Overflow)?;
+        allocations.push_back(allocation);
+    }
+
+    if allocated != flash_fee {
+        return Err(ContractError::Overflow);
+    }
+    Ok(allocations)
+}
+
+pub fn calculate_decayed_fee(
+    base_fee: u64,
+    peak_fee: u64,
+    lambda: u64,
+    elapsed_seconds: u64,
+) -> u64 {
+    let base_fee = base_fee.max(MIN_DYNAMIC_FEE);
+    if peak_fee <= base_fee || lambda == 0 || elapsed_seconds == 0 {
+        return peak_fee.max(base_fee);
+    }
+
+    let decay = libm::exp(
+        -((lambda as f64 / DYNAMIC_FEE_SCALE as f64) * elapsed_seconds as f64),
+    );
+    let variable_fee = ((peak_fee - base_fee) as f64 * decay) as u64;
+    base_fee
+        .saturating_add(variable_fee)
+        .max(MIN_DYNAMIC_FEE)
+}
+
+pub fn update_dynamic_fee_accumulator(
+    accumulator: &mut DynamicFeeAccumulator,
+    now: u64,
+) -> u64 {
+    let elapsed = now.saturating_sub(accumulator.last_updated);
+    accumulator.current_fee = calculate_decayed_fee(
+        accumulator.base_fee,
+        accumulator.peak_fee,
+        accumulator.lambda,
+        elapsed,
+    );
+    accumulator.last_updated = now;
+    accumulator.current_fee
+}
+
+pub fn record_pool_trade(
+    accumulator: &mut DynamicFeeAccumulator,
+    now: u64,
+    observed_peak_fee: u64,
+) -> u64 {
+    update_dynamic_fee_accumulator(accumulator, now);
+    if observed_peak_fee > accumulator.peak_fee {
+        accumulator.peak_fee = observed_peak_fee;
+        accumulator.current_fee = observed_peak_fee.max(MIN_DYNAMIC_FEE);
+    }
+    accumulator.current_fee.max(MIN_DYNAMIC_FEE)
 }
 
 /// Separate storage namespace for corridor weight profiles.
