@@ -7,31 +7,53 @@ description = "StellarFlow smart contracts with time-locked upgrade mechanism"
 
 [workspace]
 members = [
+    "contracts/amm",
     "contracts/analytics-engine",
+    "contracts/governance-invariants",
     "contracts/hello-world",
     "contracts/ledger-time-helper",
     "contracts/liquidity-lock",
-    "contracts/order-book",
+    "contracts/linear-vesting",
     "contracts/price-oracle",
+    "contracts/remittance-escrow",
     "contracts/reward-splitter",
     "contracts/gas-tank",
+    "contracts/vault-health-monitor",
 ]
+# tests/fuzz/fuzz/ is the cargo-fuzz coverage-guided target subcrate.
+# It depends on libfuzzer-sys, which only builds on nightly Rust, so it
+# must be excluded from this stable-Rust workspace. We list it explicitly
+# in `exclude` (defensive — cargo does not auto-discover workspace
+# members from subdirectories of listed members, but the explicit entry
+# protects against future contributors who assume auto-discovery) so
+# `cargo test --workspace` stays runnable on the project's default
+# toolchain. cargo-fuzz finds the subcrate via its own discovery from
+# tests/fuzz/fuzz/Cargo.toml.
+exclude = ["tests/fuzz/fuzz"]
 resolver = "2"
 
 [workspace.dependencies]
-soroban-sdk = { version = "=20.0.0", features = ["testutils"] }
+soroban-sdk = { version = "=20.0.0", default-features = false }
+soroban-token-sdk = { version = "=20.0.0", default-features = false }
 
 [dependencies]
-soroban-sdk = { version = "=20.0.0", features = ["testutils"] }
-soroban-token-sdk = "=20.0.0"
+# No `testutils` here: it pulls in `std` and `rand`, which do not build for
+# wasm32-unknown-unknown, so enabling it in [dependencies] broke the release
+# WASM build outright. Tests get it from [dev-dependencies] below.
+soroban-sdk = { version = "=20.0.0", default-features = false }
+soroban-token-sdk = { version = "=20.0.0", default-features = false }
 ledger-time-helper = { path = "contracts/ledger-time-helper" }
 libm = "0.2.16"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+soroban-sdk = { version = "=20.0.0", default-features = false, features = ["testutils"] }
+
 [dev-dependencies]
-soroban-sdk = { version = "=20.0.0", features = ["testutils"] }
+soroban-sdk = { version = "=20.0.0", default-features = false, features = ["testutils"] }
+ed25519-dalek = "2.0.0"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [profile.release]
 opt-level = "z"
@@ -42,3 +64,6 @@ debug-assertions = false
 panic = "abort"
 codegen-units = 1
 lto = true
+
+[patch.crates-io]
+ethnum = { path = "ethnum-patched" }
