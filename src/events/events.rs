@@ -158,6 +158,9 @@ pub const EV_COMMIT_REVEAL: Symbol = symbol_short!("cmt_rev");
 /// Orders: a commitment's bond was forfeited after its reveal deadline passed.
 pub const EV_COMMIT_FORFEIT: Symbol = symbol_short!("cmt_frf");
 
+/// ZK: a batch of deposit note commitments was inserted into the Merkle tree.
+pub const EV_ZK_BATCH_COMMIT: Symbol = symbol_short!("zk_batch");
+
 // ---------------------------------------------------------------------------
 // Cross-border fiat escrow settlement lifecycle
 // ---------------------------------------------------------------------------
@@ -572,6 +575,7 @@ mod tests {
             EV_BALLOT_CLOSED,
             EV_REMITTANCE_FEES_ROUTED,
             EV_PROPOSAL_VETOED,
+            EV_ZK_BATCH_COMMIT,
         ];
         for name in names.iter() {
             assert!(
