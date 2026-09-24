@@ -275,6 +275,9 @@ impl ContractError {
     pub const OrderAlreadyClosed: Self = Self::Unauthorized;
     pub const OrderInsufficientRemaining: Self = Self::Overflow;
     pub const OrderNotMaker: Self = Self::Unauthorized;
+    pub const OrderSideMismatch: Self = Self::Unauthorized;
+    pub const OrderPairMismatch: Self = Self::NotInitialized;
+    pub const OrderPriceNotCrossed: Self = Self::SlippageExceeded;
     pub const RoleExpirationInPast: Self = Self::UpgradeTimelockNotSatisfied;
     pub const RoleNotFound: Self = Self::NotRegistered;
     pub const UnauthorizedReentryAttempt: Self = Self::Unauthorized;
@@ -2024,6 +2027,38 @@ impl TimeLockedUpgradeContract {
     ) -> Result<i128, ContractError> {
         let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
         orders::limit::withdraw_balance(&env, owner, asset, amount)
+    }
+
+    pub fn place_buy_limit_order(
+        env: Env, maker: Address, pair: orders::limit::AssetPair, price_tick: i128, buy_amount: i128,
+    ) -> Result<orders::limit::LimitOrder, ContractError> {
+        let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
+        orders::limit::place_buy_order(&env, maker, pair, price_tick, buy_amount)
+    }
+
+    /// Tick-volume market matcher (Issue #915): sweep the book by price/time
+    /// priority, update `V_tick`, and transfer assets maker↔taker.
+    pub fn match_market_order(
+        env: Env,
+        taker: Address,
+        pair: orders::limit::AssetPair,
+        amount: i128,
+        is_buy: bool,
+    ) -> Result<orders::limit::TickMatchResult, ContractError> {
+        let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
+        orders::limit::match_market_order(&env, taker, pair, amount, is_buy)
+    }
+
+    pub fn get_tick_volume(
+        env: Env, pair: orders::limit::AssetPair, price_tick: i128, is_bid: bool,
+    ) -> i128 {
+        orders::limit::get_tick_volume(&env, pair, price_tick, is_bid)
+    }
+
+    pub fn get_liquidity_depth(
+        env: Env, pair: orders::limit::AssetPair, is_bid: bool,
+    ) -> soroban_sdk::Vec<orders::limit::LiquidityLevel> {
+        orders::limit::get_liquidity_depth(&env, pair, is_bid)
     }
 
     // ── Anti-frontrunning Commit-Reveal Order Scheme (Issue #761) ───────────
