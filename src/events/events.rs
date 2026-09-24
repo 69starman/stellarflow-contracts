@@ -146,6 +146,15 @@ pub const EV_BALLOT_CLOSED: Symbol = symbol_short!("ball_clos");
 /// Remittance: fees were routed through the fee splitter.
 pub const EV_REMITTANCE_FEES_ROUTED: Symbol = symbol_short!("rem_fee_r");
 
+/// Remittance: dynamic fee share for anchor vs yield-staker allocation was calculated.
+pub const EV_REMITTANCE_FEE_SPLIT_CALCULATED: Symbol = symbol_short!("rem_split");
+
+/// Protocol: adaptive fee was clamped to the hardcoded safety floor.
+pub const EV_PROTOCOL_FEE_FLOOR_ENFORCED: Symbol = symbol_short!("fee_floor");
+
+/// Treasury: reserve concentration exceeded the diversification threshold and a swap plan was generated.
+pub const EV_TREASURY_DIVERSIFICATION_TRIGGERED: Symbol = symbol_short!("treas_div");
+
 /// Governance: a proposal was vetoed by the Security Council.
 pub const EV_PROPOSAL_VETOED: Symbol = symbol_short!("prop_vet");
 

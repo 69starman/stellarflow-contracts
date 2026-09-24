@@ -243,6 +243,10 @@ pub enum ContractError {
     NotEmergencySigner = 80,
     /// Emergency override vote threshold not yet reached.
     OverrideThresholdNotReached = 81,
+    /// Dynamic remittance fee split configuration is invalid.
+    InvalidFeeSplitConfig = 82,
+    /// A fee allocation does not add up to the original total.
+    FeeDistributionMismatch = 83,
 }
 
 impl ContractError {
@@ -2653,6 +2657,44 @@ impl TimeLockedUpgradeContract {
         targets: Vec<admin::prune::PruneTarget>,
     ) -> Result<u32, ContractError> {
         admin::prune::prune_expired_keys(&env, &admin, &targets)
+    }
+
+    /// Bulk sweep rent deposits from helper contracts whose live state set has
+    /// already been exhausted. Returns the total bytes reclaimed.
+    pub fn sweep_inactive_helper_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::sweep_inactive_helper_contract_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn collect_expired_storage_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::collect_expired_storage_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn bulk_collect_storage_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::bulk_collect_storage_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn sweep_expired_contract_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::sweep_expired_contract_rent(&env, &admin, &treasury, &helpers)
     }
 
     // ── Dynamic Liquidity Pool Swap Fee Tier Controller ─────────────────────
