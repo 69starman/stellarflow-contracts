@@ -1022,4 +1022,50 @@ mod tests {
             Err(ContractError::Overflow)
         );
     }
+
+    #[test]
+    fn dynamic_fee_decays_toward_baseline() {
+        let fee = calculate_decayed_fee(
+            DYNAMIC_FEE_SCALE,
+            2 * DYNAMIC_FEE_SCALE,
+            DYNAMIC_FEE_SCALE,
+            1,
+        );
+        assert!(fee > DYNAMIC_FEE_SCALE);
+        assert!(fee < 2 * DYNAMIC_FEE_SCALE);
+    }
+
+    #[test]
+    fn dynamic_fee_respects_protocol_floor() {
+        assert_eq!(
+            calculate_decayed_fee(0, 0, DYNAMIC_FEE_SCALE, 1),
+            MIN_DYNAMIC_FEE
+        );
+        assert_eq!(
+            calculate_decayed_fee(
+                MIN_DYNAMIC_FEE,
+                DYNAMIC_FEE_SCALE,
+                DYNAMIC_FEE_SCALE,
+                u64::MAX,
+            ),
+            MIN_DYNAMIC_FEE
+        );
+    }
+
+    #[test]
+    fn pool_trade_updates_and_records_new_peak() {
+        let mut accumulator = DynamicFeeAccumulator {
+            base_fee: DYNAMIC_FEE_SCALE,
+            peak_fee: 2 * DYNAMIC_FEE_SCALE,
+            current_fee: 2 * DYNAMIC_FEE_SCALE,
+            lambda: DYNAMIC_FEE_SCALE,
+            last_updated: 0,
+        };
+
+        assert_eq!(
+            record_pool_trade(&mut accumulator, 1, 3 * DYNAMIC_FEE_SCALE),
+            3 * DYNAMIC_FEE_SCALE
+        );
+        assert_eq!(accumulator.peak_fee, 3 * DYNAMIC_FEE_SCALE);
+    }
 }
