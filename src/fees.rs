@@ -9,6 +9,8 @@ use soroban_sdk::{contracttype, Address, Env, Vec};
 
 pub const STANDARD_FIXED_POINT_SCALE: i128 = 10_000_000;
 pub const INTERIOR_FEE_PRECISION_SCALE: i128 = 100_000_000_000_000;
+pub const DYNAMIC_FEE_SCALE: u64 = 10_000_000;
+pub const MIN_DYNAMIC_FEE: u64 = 5_000;
 
 // ---------------------------------------------------------------------------
 // Asset pricing storage (general — unchanged)
@@ -56,6 +58,64 @@ pub struct CorridorWeightProfile {
     pub asset: AssetId,
     pub base_weight: u64,
     pub dynamic_weight: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DynamicFeeAccumulator {
+    pub base_fee: u64,
+    pub peak_fee: u64,
+    pub current_fee: u64,
+    pub lambda: u64,
+    pub last_updated: u64,
+}
+
+pub fn calculate_decayed_fee(
+    base_fee: u64,
+    peak_fee: u64,
+    lambda: u64,
+    elapsed_seconds: u64,
+) -> u64 {
+    let base_fee = base_fee.max(MIN_DYNAMIC_FEE);
+    if peak_fee <= base_fee || lambda == 0 || elapsed_seconds == 0 {
+        return peak_fee.max(base_fee);
+    }
+
+    let decay = libm::exp(
+        -((lambda as f64 / DYNAMIC_FEE_SCALE as f64) * elapsed_seconds as f64),
+    );
+    let variable_fee = ((peak_fee - base_fee) as f64 * decay) as u64;
+    base_fee
+        .saturating_add(variable_fee)
+        .max(MIN_DYNAMIC_FEE)
+}
+
+pub fn update_dynamic_fee_accumulator(
+    accumulator: &mut DynamicFeeAccumulator,
+    now: u64,
+) -> u64 {
+    let elapsed = now.saturating_sub(accumulator.last_updated);
+    accumulator.current_fee = calculate_decayed_fee(
+        accumulator.base_fee,
+        accumulator.peak_fee,
+        accumulator.lambda,
+        elapsed,
+    );
+    accumulator.last_updated = now;
+    accumulator.current_fee
+}
+
+pub fn record_pool_trade(
+    accumulator: &mut DynamicFeeAccumulator,
+    now: u64,
+    observed_peak_fee: u64,
+) -> u64 {
+    update_dynamic_fee_accumulator(accumulator, now);
+    if observed_peak_fee > accumulator.peak_fee {
+        accumulator.peak_fee = observed_peak_fee;
+        accumulator.current_fee = observed_peak_fee.max(MIN_DYNAMIC_FEE);
+    }
+    accumulator.current_fee.max(MIN_DYNAMIC_FEE)
 }
 
 /// Separate storage namespace for corridor weight profiles.
@@ -253,5 +313,51 @@ mod tests {
             normalize_to_fixed_point_footprint(too_large),
             Err(ContractError::Overflow)
         );
+    }
+
+    #[test]
+    fn dynamic_fee_decays_toward_baseline() {
+        let fee = calculate_decayed_fee(
+            DYNAMIC_FEE_SCALE,
+            2 * DYNAMIC_FEE_SCALE,
+            DYNAMIC_FEE_SCALE,
+            1,
+        );
+        assert!(fee > DYNAMIC_FEE_SCALE);
+        assert!(fee < 2 * DYNAMIC_FEE_SCALE);
+    }
+
+    #[test]
+    fn dynamic_fee_respects_protocol_floor() {
+        assert_eq!(
+            calculate_decayed_fee(0, 0, DYNAMIC_FEE_SCALE, 1),
+            MIN_DYNAMIC_FEE
+        );
+        assert_eq!(
+            calculate_decayed_fee(
+                MIN_DYNAMIC_FEE,
+                DYNAMIC_FEE_SCALE,
+                DYNAMIC_FEE_SCALE,
+                u64::MAX,
+            ),
+            MIN_DYNAMIC_FEE
+        );
+    }
+
+    #[test]
+    fn pool_trade_updates_and_records_new_peak() {
+        let mut accumulator = DynamicFeeAccumulator {
+            base_fee: DYNAMIC_FEE_SCALE,
+            peak_fee: 2 * DYNAMIC_FEE_SCALE,
+            current_fee: 2 * DYNAMIC_FEE_SCALE,
+            lambda: DYNAMIC_FEE_SCALE,
+            last_updated: 0,
+        };
+
+        assert_eq!(
+            record_pool_trade(&mut accumulator, 1, 3 * DYNAMIC_FEE_SCALE),
+            3 * DYNAMIC_FEE_SCALE
+        );
+        assert_eq!(accumulator.peak_fee, 3 * DYNAMIC_FEE_SCALE);
     }
 }
