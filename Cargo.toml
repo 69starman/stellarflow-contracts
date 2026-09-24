@@ -18,13 +18,7 @@ members = [
     "contracts/remittance-escrow",
     "contracts/reward-splitter",
     "contracts/gas-tank",
-    "contracts/relayer-allowance",
-    "contracts/stop-loss-trigger",
-    "contracts/shielded-remittance-escrow",
-    "contracts/split-remittance-escrow",
-    "contracts/fee-burn-engine",
-    "tests/benchmarks",
-    "tests/fuzz",
+    "contracts/vault-health-monitor",
 ]
 # tests/fuzz/fuzz/ is the cargo-fuzz coverage-guided target subcrate.
 # It depends on libfuzzer-sys, which only builds on nightly Rust, so it
