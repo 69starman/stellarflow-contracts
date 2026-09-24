@@ -21,6 +21,7 @@ members = [
     "contracts/relayer-allowance",
     "contracts/stop-loss-trigger",
     "contracts/shielded-remittance-escrow",
+    "contracts/split-remittance-escrow",
     "contracts/fee-burn-engine",
     "tests/benchmarks",
     "tests/fuzz",
