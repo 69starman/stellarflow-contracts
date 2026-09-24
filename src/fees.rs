@@ -94,7 +94,7 @@ pub fn settle_flash_loan_fee(
 ) -> Result<Vec<u64>, ContractError> {
     let total_lp = lp_shares.iter().try_fold(0_i128, |total, share| {
         total
-            .checked_add(*share as i128)
+            .checked_add(share as i128)
             .ok_or(ContractError::Overflow)
     })?;
     if total_lp <= 0 || lp_shares.len() == 0 {
