@@ -1257,6 +1257,7 @@ name = "stellarflow-contracts"
 version = "0.1.0"
 dependencies = [
  "ledger-time-helper",
+ "libm",
  "soroban-sdk",
  "soroban-token-sdk",
 ]
