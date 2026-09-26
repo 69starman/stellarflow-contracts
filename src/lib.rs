@@ -81,6 +81,7 @@ pub mod temp_governance;
 use crate::validation::check_bond_capacity;
 pub mod governance;
 pub mod math;
+pub mod oracle_attestation;
 pub mod orders;
 pub mod recovery;
 pub mod rescue;
@@ -217,30 +218,44 @@ pub enum ContractError {
     InvalidCircuitBreakerConfig = 67,
     /// Pool trading is currently frozen by the spot-price circuit breaker.
     CircuitBreakerTripped = 68,
+    /// Deadline for an operation has passed.
+    DeadlineReached = 69,
+    /// Deadline for an operation has not yet been reached.
+    DeadlineNotReached = 70,
+    /// Deadline is too soon (minimum offset not satisfied).
+    DeadlineTooSoon = 71,
+    /// Deadline is too far in the future (maximum offset exceeded).
+    DeadlineTooFar = 72,
+    /// Invalid argument provided to a function.
+    InvalidArgument = 73,
+    /// Invalid asset identifier.
+    InvalidAsset = 74,
+    /// Escrow is in an invalid state for the requested operation.
+    InvalidEscrowState = 75,
     /// Tick spacing must be a strictly positive integer.
-    InvalidTickSpacing = 69,
+    InvalidTickSpacing = 76,
     /// The tick index for this pool already exists.
-    TickIndexAlreadyExists = 70,
+    TickIndexAlreadyExists = 77,
     /// No tick index exists for this pool.
-    TickIndexNotFound = 71,
+    TickIndexNotFound = 78,
     /// Tick must be aligned to the pool's configured tick spacing.
-    TickNotAligned = 72,
+    TickNotAligned = 79,
     /// Tick index is outside the allowed price range bounds.
-    TickOutOfBounds = 73,
+    TickOutOfBounds = 80,
     /// Too many initialized ticks for a single pool.
-    TooManyTicks = 74,
+    TooManyTicks = 81,
     /// Protected asset (primary pool or vault reserve) cannot be rescued.
-    ProtectedAssetNotRescueable = 75,
+    ProtectedAssetNotRescueable = 82,
     /// Token rescue proposal was not found.
-    RescueProposalNotFound = 76,
+    RescueProposalNotFound = 83,
     /// Token rescue proposal is not pending.
-    RescueProposalNotPending = 77,
+    RescueProposalNotPending = 84,
     /// Mandatory timelock delay has not expired yet.
-    RescueTimelockNotExpired = 78,
+    RescueTimelockNotExpired = 85,
     /// Emergency override mechanism is disabled.
-    EmergencyOverrideDisabled = 79,
+    EmergencyOverrideDisabled = 86,
     /// Caller is not an authorized emergency signer.
-    NotEmergencySigner = 80,
+    NotEmergencySigner = 87,
     /// Emergency override vote threshold not yet reached.
     OverrideThresholdNotReached = 81,
     /// Dynamic remittance fee split configuration is invalid.
