@@ -1586,19 +1586,19 @@ impl TimeLockedUpgradeContract {
         veto::get_security_council(&env)
     }
 
-    /// Veto an active proposal, instantly transitioning it to `Vetoed` state.
+    /// Veto a queued governance proposal during its timelock.
     ///
     /// Only the designated Security Council may invoke this function. Upon veto:
-    /// 1. The proposal is marked as vetoed
+    /// 1. The queued proposal is removed and its hash is rejected on re-submission
     /// 2. Execution payload is invalidated
-    /// 3. Audit trail is recorded with reason hash
+    /// 3. Audit trail is recorded with the reason string
     /// 4. `ProposalVetoed` event is emitted
     ///
     /// # Arguments
     /// * `env` - The contract environment
     /// * `caller` - The address attempting the veto (must be Security Council)
     /// * `proposal_id` - The ID of the proposal to veto
-    /// * `reason` - Audit reason string (logged as hash for transparency)
+    /// * `reason` - Audit reason string
     ///
     /// # Errors
     /// - [`ContractError::NotSecurityCouncil`] if the caller is not the Security Council

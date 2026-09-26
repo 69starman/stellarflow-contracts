@@ -97,6 +97,10 @@ pub fn submit_governance_proposal(
         }
     }
 
+    if crate::veto::is_hash_vetoed(env, &wasm_hash) {
+        return Err(ContractError::ProposalAlreadyVetoed);
+    }
+
 /// Proposal state enumeration for governance lifecycle management.
 ///
 /// Proposals transition through states as they move through voting, approval,

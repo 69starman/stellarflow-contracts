@@ -159,7 +159,6 @@ pub const EV_PROTOCOL_FEE_FLOOR_ENFORCED: Symbol = symbol_short!("fee_floor");
 pub const EV_TREASURY_DIVERSIFICATION_TRIGGERED: Symbol = symbol_short!("treas_div");
 
 /// Governance: a proposal was vetoed by the Security Council.
-pub const EV_PROPOSAL_VETOED: Symbol = symbol_short!("prop_vet");
 
 /// Orders: a trader committed to a hidden trade (commit-reveal, Issue #761).
 pub const EV_COMMIT_NEW: Symbol = symbol_short!("cmt_new");
@@ -351,7 +350,7 @@ pub struct ProposalVetoedEvent {
     pub proposal_id: u64,
     pub vetoed_by: soroban_sdk::Address,
     pub vetoed_at: u64,
-    pub reason_hash: soroban_sdk::String,
+    pub reason: soroban_sdk::String,
 }
 
 /// Emit a ProposalVetoed event when the Security Council vetoes a proposal.
@@ -361,7 +360,7 @@ pub struct ProposalVetoedEvent {
 /// * `proposal_id` - ID of the proposal that was vetoed
 /// * `vetoed_by` - Address of the Security Council that performed the veto
 /// * `vetoed_at` - Ledger timestamp of the veto
-/// * `reason` - Audit reason string (hashed in event for transparency)
+/// * `reason` - Audit reason string
 pub fn emit_proposal_vetoed(
     env: &Env,
     proposal_id: u64,
@@ -375,12 +374,12 @@ pub fn emit_proposal_vetoed(
         proposal_id,
         vetoed_by: vetoed_by.clone(),
         vetoed_at,
-        reason_hash: reason,
+        reason,
     };
     
     emit_simple3(
         env,
-        EV_PROPOSAL_VETOED,
+        Symbol::new(env, "ProposalVetoed"),
         proposal_id_sym,
         symbol_short!("vetoed"),
         event,
@@ -550,7 +549,8 @@ mod tests {
 
     #[test]
     fn event_names_are_distinct() {
-        let mut seen = soroban_sdk::Map::<Symbol, ()>::new(&Env::default());
+        let env = Env::default();
+        let mut seen = soroban_sdk::Map::<Symbol, ()>::new(&env);
         let names = [
             EV_PRICE_UPDATE,
             EV_PRICE_FLOOR_SET,
@@ -586,7 +586,7 @@ mod tests {
             EV_BALLOT_OPENED,
             EV_BALLOT_CLOSED,
             EV_REMITTANCE_FEES_ROUTED,
-            EV_PROPOSAL_VETOED,
+            Symbol::new(&env, "ProposalVetoed"),
             EV_ZK_BATCH_COMMIT,
         ];
         for name in names.iter() {
