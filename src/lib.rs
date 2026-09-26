@@ -761,6 +761,9 @@ impl TimeLockedUpgradeContract {
         let data = Self::get_data(env.clone())?;
         if data.admin != proposer { return Err(ContractError::NotAdmin); }
         proposer.require_auth();
+        if veto::is_hash_vetoed(&env, &new_wasm_hash) {
+            return Err(ContractError::ProposalAlreadyVetoed);
+        }
         consume_nonce(&env, &proposer, nonce, salt, salt_signature)?;
 
         // Verify multi-sig quorum threshold
@@ -814,6 +817,9 @@ impl TimeLockedUpgradeContract {
         executor.require_auth();
         consume_nonce(&env, &executor, nonce, salt, signature)?;
         let pending: StagedUpgrade = env.storage().instance().get(&PENDING_UPGRADE_KEY).ok_or(ContractError::NoPendingUpgrade)?;
+        if veto::is_hash_vetoed(&env, &pending.new_wasm_hash) {
+            return Err(ContractError::ProposalAlreadyVetoed);
+        }
         if !verify_staged_delay(pending.staged_at, env.ledger().sequence()) {
             return Err(ContractError::UpgradeTimelockNotSatisfied);
         }

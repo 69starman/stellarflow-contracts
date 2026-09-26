@@ -225,6 +225,17 @@ pub fn veto_proposal(
     // Store veto record
     env.storage().instance().set(&(VETO_RECORD_KEY, proposal_id), &veto_record);
     env.storage().instance().set(&(VETOED_HASH_KEY, proposal.wasm_hash), &true);
+    // The upgrade executor uses a separate queue. Clear that entry only when
+    // it contains the vetoed WASM hash.
+    if let Some(pending) = env
+        .storage()
+        .instance()
+        .get::<_, crate::governance::StagedUpgrade>(&crate::PENDING_UPGRADE_KEY)
+    {
+        if pending.new_wasm_hash == proposal.wasm_hash {
+            env.storage().instance().remove(&crate::PENDING_UPGRADE_KEY);
+        }
+    }
     // Removing the queued proposal also prevents execution through the
     // ordinary timelock path and the emergency override path.
     env.storage().instance().remove(&crate::governance::GOVERNANCE_PROPOSAL_KEY);
@@ -611,10 +622,18 @@ mod tests {
             env.storage().instance().set(&SECURITY_COUNCIL_KEY, &council);
             let first_hash = BytesN::from_array(&env, &[1; 32]);
             let second_hash = BytesN::from_array(&env, &[2; 32]);
+            let pending = crate::governance::StagedUpgrade {
+                new_wasm_hash: first_hash.clone(),
+                proposer: Address::generate(&env),
+                staged_at: env.ledger().timestamp(),
+                execute_at: env.ledger().timestamp() + crate::UPGRADE_DELAY_SECONDS,
+            };
+            env.storage().instance().set(&crate::PENDING_UPGRADE_KEY, &pending);
             queue_test_proposal(&env, 1, first_hash.clone());
             let reason = String::from_slice(&env, "unsafe upgrade");
             assert_eq!(veto_proposal(&env, council.clone(), 1, reason.clone()), Ok(()));
             assert!(!env.storage().instance().has(&crate::governance::GOVERNANCE_PROPOSAL_KEY));
+            assert!(!env.storage().instance().has(&crate::PENDING_UPGRADE_KEY));
             assert!(is_hash_vetoed(&env, &first_hash));
             assert!(!crate::governance::is_proposal_executable(&env, 1));
             assert_eq!(
@@ -625,7 +644,9 @@ mod tests {
             assert_eq!(veto_proposal(&env, council.clone(), 1, reason.clone()), Err(ContractError::ProposalAlreadyVetoed));
 
             queue_test_proposal(&env, 2, second_hash.clone());
+            env.storage().instance().set(&crate::PENDING_UPGRADE_KEY, &pending);
             assert_eq!(veto_proposal(&env, council.clone(), 2, reason), Ok(()));
+            assert!(env.storage().instance().has(&crate::PENDING_UPGRADE_KEY));
             assert!(get_veto_record(&env, 1).is_some());
             assert!(get_veto_record(&env, 2).is_some());
             assert!(is_hash_vetoed(&env, &second_hash));
