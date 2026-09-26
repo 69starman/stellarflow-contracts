@@ -257,33 +257,11 @@ pub enum ContractError {
     /// Caller is not an authorized emergency signer.
     NotEmergencySigner = 87,
     /// Emergency override vote threshold not yet reached.
-    OverrideThresholdNotReached = 88,
-    /// Insufficient oracle attestations for consensus (need 2-of-3).
-    InsufficientOracleAttestations = 89,
-    /// Oracle attestations conflict on settlement details.
-    OracleAttestationConflict = 90,
-    /// Oracle not authorized for this asset corridor.
-    OracleNotAuthorized = 91,
-    /// Oracle attestation signature verification failed.
-    OracleInvalidSignature = 92,
-    /// Oracle attestation is stale.
-    OracleAttestationStale = 93,
-    /// Duplicate attestation from same oracle for same escrow.
-    DuplicateOracleAttestation = 94,
-    /// Oracle registry not configured for this asset.
-    OracleRegistryNotConfigured = 95,
-    /// HTLC not found.
-    HtlcNotFound = 96,
-    /// HTLC is not active (already settled or refunded).
-    HtlcNotActive = 97,
-    /// Invalid pre-image provided for HTLC claim.
-    InvalidPreImage = 98,
-    /// Too many active HTLCs for the depositor.
-    TooManyActiveHtlcs = 99,
-    /// Zero swap amount provided.
-    ZeroSwapAmount = 100,
-    /// Route execution failed.
-    RouteExecutionFailed = 101,
+    OverrideThresholdNotReached = 81,
+    /// Dynamic remittance fee split configuration is invalid.
+    InvalidFeeSplitConfig = 82,
+    /// A fee allocation does not add up to the original total.
+    FeeDistributionMismatch = 83,
 }
 
 impl ContractError {
@@ -2127,6 +2105,45 @@ impl TimeLockedUpgradeContract {
     ) -> soroban_sdk::Vec<orders::limit::LiquidityLevel> {
         orders::limit::get_liquidity_depth(&env, pair, is_bid)
     }
+    /// Calculate spread ratio for a trading pair: S = (P_ask_min - P_bid_max) / P_bid_max
+    pub fn calculate_spread_ratio(env: Env, pair: orders::limit::AssetPair) -> Result<i128, ContractError> {
+        let (best_bid_opt, best_ask_opt) = orders::limit::get_best_bid_ask(&env, &pair);
+        if best_bid_opt.is_none() || best_ask_opt.is_none() {
+            return Err(ContractError::InsufficientLiquidityDepth);
+        }
+        orders::limit::calculate_spread_ratio(best_bid_opt.unwrap(), best_ask_opt.unwrap())
+    }
+
+    /// Get best bid and best ask prices for a trading pair
+    pub fn get_best_bid_ask(env: Env, pair: orders::limit::AssetPair) -> (Option<i128>, Option<i128>) {
+        orders::limit::get_best_bid_ask(&env, &pair)
+    }
+
+    /// Check spread imbalance and trigger alert if spread > 5%
+    pub fn check_spread_imbalance(env: Env, pair: orders::limit::AssetPair) -> Result<orders::limit::SpreadImbalance, ContractError> {
+        orders::limit::check_spread_imbalance(&env, &pair)
+    }
+
+    /// Emit liquidity provider alert
+    pub fn emit_liquidity_provider_alert(
+        env: Env,
+        pair: orders::limit::AssetPair,
+        best_bid: i128,
+        best_ask: i128,
+        spread_ratio: i128,
+    ) -> Result<(), ContractError> {
+        orders::limit::emit_liquidity_provider_alert(&env, &pair, best_bid, best_ask, spread_ratio)
+    }
+
+    /// Check if liquidity is thin
+    pub fn is_liquidity_thin(env: Env, pair: orders::limit::AssetPair) -> bool {
+        orders::limit::is_liquidity_thin(&env, &pair)
+    }
+
+    /// Enforce fallback market maker pricing curves when liquidity is thin
+    pub fn enforce_fallback_pricing(env: Env, pair: orders::limit::AssetPair, base_price: i128) -> Result<i128, ContractError> {
+        orders::limit::enforce_fallback_pricing(&env, &pair, base_price)
+    }
 
     // ── Anti-frontrunning Commit-Reveal Order Scheme (Issue #761) ───────────
 
@@ -2694,6 +2711,44 @@ impl TimeLockedUpgradeContract {
         targets: Vec<admin::prune::PruneTarget>,
     ) -> Result<u32, ContractError> {
         admin::prune::prune_expired_keys(&env, &admin, &targets)
+    }
+
+    /// Bulk sweep rent deposits from helper contracts whose live state set has
+    /// already been exhausted. Returns the total bytes reclaimed.
+    pub fn sweep_inactive_helper_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::sweep_inactive_helper_contract_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn collect_expired_storage_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::collect_expired_storage_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn bulk_collect_storage_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::bulk_collect_storage_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn sweep_expired_contract_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::sweep_expired_contract_rent(&env, &admin, &treasury, &helpers)
     }
 
     // ── Dynamic Liquidity Pool Swap Fee Tier Controller ─────────────────────
