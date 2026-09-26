@@ -174,7 +174,10 @@ mod tests {
             standard_min_stake: 1_000,
             premier_min_stake: 10_000,
         };
-        assert_eq!(validate_tier_config(&invalid), Err(ContractError::InvalidTierConfig));
+        assert_eq!(
+            validate_tier_config(&invalid),
+            Err(ContractError::InvalidTierConfig)
+        );
     }
 
     #[test]

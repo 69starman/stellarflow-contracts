@@ -209,33 +209,29 @@ pub fn normalize_to_nine(value: i128, native_decimals: u32) -> Result<i128, Erro
         .checked_mul(INTERIOR_SCALE)
         .ok_or(Error::PriceMathOverflow)?;
 
-    if native_decimals < TARGET {
+    let normalized_in_interior_space = if native_decimals < TARGET {
         let diff = TARGET - native_decimals;
-        
+
         // Trap power overflow early
         let multiplier = 10_i128
             .checked_pow(diff)
             .ok_or(Error::PriceMathOverflow)?;
-        
+
         // Use checked_mul to explicitly trap multiplication overflow
-        scaled
-        let multiplier = 10_i128.checked_pow(diff).ok_or(Error::PriceMathOverflow)?;
         scaled
             .checked_mul(multiplier)
             .ok_or(Error::PriceMathOverflow)?
     } else if native_decimals > TARGET {
         let diff = native_decimals - TARGET;
-        
+
         // Trap power overflow early
         let divisor = 10_i128
             .checked_pow(diff)
             .ok_or(Error::PriceMathOverflow)?;
-        
+
         // Explicit divide-by-zero trap (defensive, 10^n cannot be zero)
-        if divisor == 0 {
-            return Err(Error::PriceMathOverflow);
-        }
-        
+        require_nonzero_denominator(divisor)?;
+
         // Use checked_div to trap any division anomalies
         scaled
             .checked_div(divisor)
@@ -245,18 +241,6 @@ pub fn normalize_to_nine(value: i128, native_decimals: u32) -> Result<i128, Erro
     };
 
     // Final checked division to scale back down
-    normalized_in_interior_space
-        .checked_div(INTERIOR_SCALE)
-        .ok_or(Error::PriceMathOverflow)
-        let divisor = 10_i128.checked_pow(diff).ok_or(Error::PriceMathOverflow)?;
-        require_nonzero_denominator(divisor)?;
-        scaled
-            .checked_div(divisor)
-            .ok_or(Error::PriceMathOverflow)?
-    } else {
-        scaled
-    };
-
     require_nonzero_denominator(INTERIOR_SCALE)?;
     normalized_in_interior_space
         .checked_div(INTERIOR_SCALE)
@@ -522,7 +506,10 @@ pub fn calculate_max_acceptable_rate(
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
     use super::*;
+    use alloc::string::ToString;
     use soroban_sdk::Env;
 
     // --- format_price tests ---------------------------------------------------
@@ -610,7 +597,38 @@ mod tests {
         assert_eq!(result, Ok(u32::MAX));
     }
 
-    // --- normalize_to_seven tests ---------------------------------------------
+    // --- geometric_mean tests ------------------------------------------------
+
+    #[test]
+    fn test_geometric_mean_equal_values() {
+        // sqrt(100 * 100) = 100
+        assert_eq!(geometric_mean(100, 100), Some(100));
+    }
+
+    #[test]
+    fn test_geometric_mean_different_values() {
+        // sqrt(4 * 9) = sqrt(36) = 6
+        assert_eq!(geometric_mean(4, 9), Some(6));
+    }
+
+    #[test]
+    fn test_geometric_mean_zero() {
+        assert_eq!(geometric_mean(0, 1000), Some(0));
+        assert_eq!(geometric_mean(1000, 0), Some(0));
+    }
+
+    #[test]
+    fn test_geometric_mean_negative_returns_none() {
+        assert_eq!(geometric_mean(-1, 100), None);
+        assert_eq!(geometric_mean(100, -1), None);
+    }
+
+    #[test]
+    fn test_geometric_mean_scaled_prices() {
+        // sqrt(1_000_000 * 4_000_000) = sqrt(4_000_000_000_000) = 2_000_000
+        assert_eq!(geometric_mean(1_000_000, 4_000_000), Some(2_000_000));
+    }
+
 
     #[test]
     fn test_normalize_to_seven_scale_up() {

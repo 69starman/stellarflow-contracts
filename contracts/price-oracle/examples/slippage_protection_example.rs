@@ -37,13 +37,15 @@ fn example_simple_conversion_with_slippage() {
     // Scenario A: Rate within bounds (conversion succeeds)
     let actual_rate_good = 1_520_000_000; // 1.3% above expected
 
-    let result = enforce_slippage_tolerance(expected_rate, actual_rate_good, user_slippage_tolerance);
+    let result =
+        enforce_slippage_tolerance(expected_rate, actual_rate_good, user_slippage_tolerance);
     assert!(result.is_ok(), "Conversion should succeed within tolerance");
 
     // Scenario B: Rate exceeds bounds (conversion fails)
     let actual_rate_bad = 1_540_000_000; // 2.67% above expected (exceeds 2% tolerance)
 
-    let result = enforce_slippage_tolerance(expected_rate, actual_rate_bad, user_slippage_tolerance);
+    let result =
+        enforce_slippage_tolerance(expected_rate, actual_rate_bad, user_slippage_tolerance);
     assert_eq!(
         result,
         Err(Error::SlippageToleranceExceeded),
@@ -158,7 +160,10 @@ fn example_slippage_monitoring() {
 
     println!("Conversion Analytics:");
     println!("  Total conversions: {}", total);
-    println!("  Successful: {} ({}%)", successful_conversions, success_rate);
+    println!(
+        "  Successful: {} ({}%)",
+        successful_conversions, success_rate
+    );
     println!("  Rejected: {}", rejected_conversions);
     println!("  Average deviation: {} bps", avg_deviation);
 
@@ -210,7 +215,7 @@ impl MockPriceOracle {
 
     fn mock_get_price(asset: &str) -> i128 {
         match asset {
-            "NGN" => 1_600_000_000, // 1.6 (in 9 decimals)
+            "NGN" => 1_600_000_000,  // 1.6 (in 9 decimals)
             "XLM" => 32_000_000_000, // 32.0
             "GHS" => 400_000_000,    // 0.4
             _ => 1_000_000_000,
@@ -226,7 +231,8 @@ fn example_oracle_integration() {
     let slippage = 200; // 2% tolerance
 
     // Execute conversion
-    let result = MockPriceOracle::convert_with_protection("NGN", "GHS", amount, expected_rate, slippage);
+    let result =
+        MockPriceOracle::convert_with_protection("NGN", "GHS", amount, expected_rate, slippage);
 
     match result {
         Ok(ghs_amount) => {
