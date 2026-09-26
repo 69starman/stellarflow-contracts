@@ -247,6 +247,20 @@ pub enum ContractError {
     InvalidFeeSplitConfig = 82,
     /// A fee allocation does not add up to the original total.
     FeeDistributionMismatch = 83,
+    /// Flash loan arbitrage detected: pool invariant violated post-transaction.
+    /// Closes #757 / #1023.
+    FlashLoanArbitrageDetected = 84,
+    /// Flash loan liquidation failed because the vault health factor did not
+    /// recover above the safety threshold after collateral was seized and the
+    /// flash loan was repaid. Closes #1023.
+    FlashLiquidationHealthCheckFailed = 85,
+    /// Flash loan liquidation failed because the repayment amount is
+    /// insufficient to cover the outstanding vault debt. Closes #1023.
+    FlashLiquidationInsufficientRepay = 86,
+    /// Post-upgrade health check detected storage or admin state inconsistency.
+    UpgradeHealthCheckFailed = 87,
+    /// A multi-hop route execution failed at one of the intermediate hops.
+    RouteExecutionFailed = 88,
 }
 
 impl ContractError {
@@ -1904,6 +1918,36 @@ impl TimeLockedUpgradeContract {
             &position,
             purchase_collateral,
         )
+    }
+
+    /// Atomically liquidate a distressed vault position using a flash loan.
+    ///
+    /// This entrypoint implements the full atomic liquidation sequence for
+    /// issue #1023:
+    ///
+    /// 1. **Validate** — confirm the vault is below the liquidation threshold.
+    /// 2. **Borrow** — record flash loan obligation (principal + fee).
+    /// 3. **Repay vault debt** — seize proportional collateral plus the 5%
+    ///    liquidator bonus from the distressed vault.
+    /// 4. **Swap collateral** — exchange seized collateral back to the debt
+    ///    asset via the AMM/DEX router specified in `params`.
+    /// 5. **Repay flash loan** — settle principal + fee with the lender within
+    ///    the same transaction frame.
+    /// 6. **Health check** — verify the vault's post-liquidation health factor
+    ///    is above `params.min_health_factor_bps` (defaults to 110%).
+    ///
+    /// Returns [`ContractError::FlashLiquidationHealthCheckFailed`] if the
+    /// vault is healthy or fails to recover after liquidation, and
+    /// [`ContractError::FlashLiquidationInsufficientRepay`] if collateral
+    /// proceeds do not cover the flash loan principal + fee.
+    ///
+    /// Closes #1023.
+    pub fn flash_loan_liquidate(
+        env: Env,
+        position: vaults::liquidation::VaultPosition,
+        params: vaults::liquidation::FlashLoanLiquidationParams,
+    ) -> Result<vaults::liquidation::FlashLoanLiquidationResult, ContractError> {
+        vaults::liquidation::flash_loan_liquidate(&env, &position, &params)
     }
 
     pub fn vault_config(env: Env) -> Option<vaults::autocompound::VaultConfig> {
