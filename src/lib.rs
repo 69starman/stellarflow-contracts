@@ -81,6 +81,7 @@ pub mod temp_governance;
 use crate::validation::check_bond_capacity;
 pub mod governance;
 pub mod math;
+pub mod oracle_attestation;
 pub mod orders;
 pub mod recovery;
 pub mod rescue;
@@ -217,45 +218,50 @@ pub enum ContractError {
     InvalidCircuitBreakerConfig = 67,
     /// Pool trading is currently frozen by the spot-price circuit breaker.
     CircuitBreakerTripped = 68,
+    /// Deadline for an operation has passed.
+    DeadlineReached = 69,
+    /// Deadline for an operation has not yet been reached.
+    DeadlineNotReached = 70,
+    /// Deadline is too soon (minimum offset not satisfied).
+    DeadlineTooSoon = 71,
+    /// Deadline is too far in the future (maximum offset exceeded).
+    DeadlineTooFar = 72,
+    /// Invalid argument provided to a function.
+    InvalidArgument = 73,
+    /// Invalid asset identifier.
+    InvalidAsset = 74,
+    /// Escrow is in an invalid state for the requested operation.
+    InvalidEscrowState = 75,
     /// Tick spacing must be a strictly positive integer.
-    InvalidTickSpacing = 69,
+    InvalidTickSpacing = 76,
     /// The tick index for this pool already exists.
-    TickIndexAlreadyExists = 70,
+    TickIndexAlreadyExists = 77,
     /// No tick index exists for this pool.
-    TickIndexNotFound = 71,
+    TickIndexNotFound = 78,
     /// Tick must be aligned to the pool's configured tick spacing.
-    TickNotAligned = 72,
+    TickNotAligned = 79,
     /// Tick index is outside the allowed price range bounds.
-    TickOutOfBounds = 73,
+    TickOutOfBounds = 80,
     /// Too many initialized ticks for a single pool.
-    TooManyTicks = 74,
+    TooManyTicks = 81,
     /// Protected asset (primary pool or vault reserve) cannot be rescued.
-    ProtectedAssetNotRescueable = 75,
+    ProtectedAssetNotRescueable = 82,
     /// Token rescue proposal was not found.
-    RescueProposalNotFound = 76,
+    RescueProposalNotFound = 83,
     /// Token rescue proposal is not pending.
-    RescueProposalNotPending = 77,
+    RescueProposalNotPending = 84,
     /// Mandatory timelock delay has not expired yet.
-    RescueTimelockNotExpired = 78,
+    RescueTimelockNotExpired = 85,
     /// Emergency override mechanism is disabled.
-    EmergencyOverrideDisabled = 79,
+    EmergencyOverrideDisabled = 86,
     /// Caller is not an authorized emergency signer.
-    NotEmergencySigner = 80,
+    NotEmergencySigner = 87,
     /// Emergency override vote threshold not yet reached.
     OverrideThresholdNotReached = 81,
-    /// The supplied concentrated-liquidity tick range is empty, unaligned, or
-    /// outside the pool's permitted price bounds.
-    InvalidTickRange = 82,
-    /// No concentrated liquidity position exists for the pool and tick range.
-    PositionNotFound = 83,
-    /// The caller does not own the concentrated liquidity position.
-    PositionNotOwned = 84,
-    /// A concentrated liquidity position cannot be transferred to its owner.
-    PositionTransferToSelf = 85,
-    /// The position is pledged as collateral and is locked against transfer.
-    PositionCollateralLocked = 86,
-    /// A concentrated liquidity position already exists for this tick range.
-    PositionAlreadyExists = 87,
+    /// Dynamic remittance fee split configuration is invalid.
+    InvalidFeeSplitConfig = 82,
+    /// A fee allocation does not add up to the original total.
+    FeeDistributionMismatch = 83,
 }
 
 impl ContractError {
@@ -2146,6 +2152,45 @@ impl TimeLockedUpgradeContract {
     ) -> soroban_sdk::Vec<orders::limit::LiquidityLevel> {
         orders::limit::get_liquidity_depth(&env, pair, is_bid)
     }
+    /// Calculate spread ratio for a trading pair: S = (P_ask_min - P_bid_max) / P_bid_max
+    pub fn calculate_spread_ratio(env: Env, pair: orders::limit::AssetPair) -> Result<i128, ContractError> {
+        let (best_bid_opt, best_ask_opt) = orders::limit::get_best_bid_ask(&env, &pair);
+        if best_bid_opt.is_none() || best_ask_opt.is_none() {
+            return Err(ContractError::InsufficientLiquidityDepth);
+        }
+        orders::limit::calculate_spread_ratio(best_bid_opt.unwrap(), best_ask_opt.unwrap())
+    }
+
+    /// Get best bid and best ask prices for a trading pair
+    pub fn get_best_bid_ask(env: Env, pair: orders::limit::AssetPair) -> (Option<i128>, Option<i128>) {
+        orders::limit::get_best_bid_ask(&env, &pair)
+    }
+
+    /// Check spread imbalance and trigger alert if spread > 5%
+    pub fn check_spread_imbalance(env: Env, pair: orders::limit::AssetPair) -> Result<orders::limit::SpreadImbalance, ContractError> {
+        orders::limit::check_spread_imbalance(&env, &pair)
+    }
+
+    /// Emit liquidity provider alert
+    pub fn emit_liquidity_provider_alert(
+        env: Env,
+        pair: orders::limit::AssetPair,
+        best_bid: i128,
+        best_ask: i128,
+        spread_ratio: i128,
+    ) -> Result<(), ContractError> {
+        orders::limit::emit_liquidity_provider_alert(&env, &pair, best_bid, best_ask, spread_ratio)
+    }
+
+    /// Check if liquidity is thin
+    pub fn is_liquidity_thin(env: Env, pair: orders::limit::AssetPair) -> bool {
+        orders::limit::is_liquidity_thin(&env, &pair)
+    }
+
+    /// Enforce fallback market maker pricing curves when liquidity is thin
+    pub fn enforce_fallback_pricing(env: Env, pair: orders::limit::AssetPair, base_price: i128) -> Result<i128, ContractError> {
+        orders::limit::enforce_fallback_pricing(&env, &pair, base_price)
+    }
 
     // ── Anti-frontrunning Commit-Reveal Order Scheme (Issue #761) ───────────
 
@@ -2715,6 +2760,44 @@ impl TimeLockedUpgradeContract {
         admin::prune::prune_expired_keys(&env, &admin, &targets)
     }
 
+    /// Bulk sweep rent deposits from helper contracts whose live state set has
+    /// already been exhausted. Returns the total bytes reclaimed.
+    pub fn sweep_inactive_helper_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::sweep_inactive_helper_contract_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn collect_expired_storage_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::collect_expired_storage_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn bulk_collect_storage_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::bulk_collect_storage_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn sweep_expired_contract_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::sweep_expired_contract_rent(&env, &admin, &treasury, &helpers)
+    }
+
     // ── Dynamic Liquidity Pool Swap Fee Tier Controller ─────────────────────
 
     /// Initialize the fee tier controller with bounded safety ranges.
@@ -2939,6 +3022,15 @@ impl TimeLockedUpgradeContract {
 }
 
     // ── Groth16 ZK Proof Verification (Issue #725) ────────────────────────
+
+    /// Validate an uploaded Groth16 proving key against the BN254 schema.
+    pub fn validate_zk_proving_key(
+        _env: Env,
+        key: zk::proving_key::UploadedProvingKey,
+        schema: zk::proving_key::ProvingKeySchema,
+    ) -> Result<(), ContractError> {
+        zk::proving_key::validate_proving_key(&key, &schema)
+    }
 
     /// Register a Groth16 verification key for a circuit on-chain.
     pub fn register_zk_verification_key(
