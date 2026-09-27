@@ -262,6 +262,20 @@ pub enum ContractError {
     InvalidFeeSplitConfig = 82,
     /// A fee allocation does not add up to the original total.
     FeeDistributionMismatch = 83,
+    /// The supplied concentrated-liquidity tick range is empty, unaligned, or
+    /// outside the pool's permitted price bounds.
+    InvalidTickRange = 88,
+    /// No concentrated liquidity position exists for the pool and tick range.
+    PositionNotFound = 89,
+    /// The caller does not own the concentrated liquidity position.
+    PositionNotOwned = 90,
+    /// A concentrated liquidity position cannot be transferred to its owner.
+    PositionTransferToSelf = 91,
+    /// The position is pledged as collateral and is locked against transfer.
+    PositionCollateralLocked = 92,
+    /// A concentrated liquidity position already exists for this tick range.
+    PositionAlreadyExists = 93,
+
 }
 
 impl ContractError {
