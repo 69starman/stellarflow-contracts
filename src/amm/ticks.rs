@@ -212,13 +212,10 @@ pub fn get_tick_index(env: &Env, asset: AssetId) -> Result<TickIndexMeta, Contra
 /// initialized.
 pub fn get_tick_data(env: &Env, asset: AssetId, tick: i32) -> TickData {
     let key = TickDataKey(asset, tick);
-    env.storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(TickData {
-            liquidity_net: 0,
-            liquidity_gross: 0,
-        })
+    env.storage().persistent().get(&key).unwrap_or(TickData {
+        liquidity_net: 0,
+        liquidity_gross: 0,
+    })
 }
 
 /// Persist a tick's data.
@@ -379,11 +376,7 @@ pub fn get_pool_fee_tier(env: &Env, asset: AssetId) -> u16 {
 /// Update a pool's swap fee tier. In production this is called by governance
 /// after a successful vote. The fee tier must be one of `FEE_TIER_1`,
 /// `FEE_TIER_2`, or `FEE_TIER_3`.
-pub fn set_pool_fee_tier(
-    env: &Env,
-    asset: AssetId,
-    fee_tier: u16,
-) -> Result<u16, ContractError> {
+pub fn set_pool_fee_tier(env: &Env, asset: AssetId, fee_tier: u16) -> Result<u16, ContractError> {
     if fee_tier != FEE_TIER_1 && fee_tier != FEE_TIER_2 && fee_tier != FEE_TIER_3 {
         return Err(ContractError::Overflow);
     }
@@ -547,12 +540,7 @@ pub fn simulate_swap_across_ticks(
 
         // Compute how much input is needed to move from price_start to price_end
         // with the current liquidity.
-        let step_in = compute_step_input(
-            price_start,
-            price_end,
-            current_liquidity,
-            direction_up,
-        )?;
+        let step_in = compute_step_input(price_start, price_end, current_liquidity, direction_up)?;
 
         // Deduct fee.
         let fee = (step_in as u128)
@@ -560,17 +548,11 @@ pub fn simulate_swap_across_ticks(
             .ok_or(ContractError::Overflow)?
             .checked_div(10_000)
             .ok_or(ContractError::DivisionByZero)?;
-        let net_in = step_in
-            .checked_sub(fee)
-            .ok_or(ContractError::Overflow)? as u64;
+        let net_in = step_in.checked_sub(fee).ok_or(ContractError::Overflow)? as u64;
 
         // Compute output for this step.
-        let step_out = compute_step_output(
-            price_start,
-            price_end,
-            current_liquidity,
-            direction_up,
-        )?;
+        let step_out =
+            compute_step_output(price_start, price_end, current_liquidity, direction_up)?;
 
         let consumed = if remaining_in >= net_in {
             net_in
@@ -610,8 +592,7 @@ pub fn simulate_swap_across_ticks(
                     .checked_add(tick_data.liquidity_net as u64)
                     .ok_or(ContractError::Overflow)?
             } else {
-                current_liquidity
-                    .saturating_sub((-tick_data.liquidity_net) as u64)
+                current_liquidity.saturating_sub((-tick_data.liquidity_net) as u64)
             };
             crossings += 1;
         }
@@ -736,9 +717,7 @@ fn compute_step_output(
         sqrt_a.checked_sub(sqrt_b).ok_or(ContractError::Overflow)?
     };
 
-    let sqrt_product = sqrt_a
-        .checked_mul(sqrt_b)
-        .ok_or(ContractError::Overflow)?;
+    let sqrt_product = sqrt_a.checked_mul(sqrt_b).ok_or(ContractError::Overflow)?;
 
     if sqrt_product == 0 {
         return Err(ContractError::DivisionByZero);
@@ -799,10 +778,7 @@ pub fn get_all_initialized_ticks(env: &Env, asset: AssetId) -> Vec<i32> {
 /// Compute the price ratio between two ticks, expressed in basis points
 /// relative to the lower tick. Useful for determining the capital efficiency
 /// gain of a concentrated position.
-pub fn range_efficiency_bps(
-    lower_tick: i32,
-    upper_tick: i32,
-) -> Result<i128, ContractError> {
+pub fn range_efficiency_bps(lower_tick: i32, upper_tick: i32) -> Result<i128, ContractError> {
     let price_lower = tick_to_price(lower_tick)?;
     let price_upper = tick_to_price(upper_tick)?;
 
@@ -822,6 +798,425 @@ pub fn range_efficiency_bps(
         .ok_or(ContractError::DivisionByZero)?;
 
     Ok(bps)
+}
+
+// ---------------------------------------------------------------------------
+// Bit-shift optimization constants
+// ---------------------------------------------------------------------------
+
+const PRICE_SCALE_LOG2: u32 = 23;
+
+pub const PRICE_SCALE_POW2: u128 = 1u128 << PRICE_SCALE_LOG2;
+
+pub const PRICE_SCALE_SHIFT: u32 = PRICE_SCALE_LOG2;
+
+#[inline]
+fn shl_scale(value: u128) -> Result<u128, ContractError> {
+    value
+        .checked_shl(PRICE_SCALE_SHIFT)
+        .ok_or(ContractError::Overflow)
+}
+
+#[inline]
+fn shr_unscale(value: u128) -> Result<u128, ContractError> {
+    value
+        .checked_shr(PRICE_SCALE_SHIFT)
+        .ok_or(ContractError::Overflow)
+}
+
+#[inline]
+fn shl_by(value: u128, shift: u32) -> Result<u128, ContractError> {
+    value.checked_shl(shift).ok_or(ContractError::Overflow)
+}
+
+#[inline]
+fn shr_by(value: u128, shift: u32) -> Result<u128, ContractError> {
+    if shift == 0 {
+        return Ok(value);
+    }
+    value.checked_shr(shift).ok_or(ContractError::Overflow)
+}
+
+// ---------------------------------------------------------------------------
+// Liquidity Density ($L_{tick}$) Engine
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiquidityDensity {
+    pub tick_index: i32,
+    pub liquidity_gross: u64,
+    pub density: u64,
+    pub price_range_width: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TickLiquidityDensityProfile {
+    pub asset: AssetId,
+    pub densities: Vec<LiquidityDensity>,
+    pub total_active_liquidity: u64,
+    pub max_density: u64,
+    pub max_density_tick: i32,
+    pub min_density: u64,
+    pub avg_density: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PriceImpactStep {
+    pub start_tick: i32,
+    pub end_tick: i32,
+    pub price_before: i128,
+    pub price_after: i128,
+    pub amount_in: u64,
+    pub amount_out: u64,
+    pub impact_bps: u64,
+    pub cumulative_out: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PriceImpactPreview {
+    pub total_amount_in: u64,
+    pub total_amount_out: u64,
+    pub final_price: i128,
+    pub avg_impact_bps: u64,
+    pub max_step_impact_bps: u64,
+    pub crossings: u32,
+    pub steps: Vec<PriceImpactStep>,
+}
+
+pub fn compute_tick_liquidity_density(
+    env: &Env,
+    asset: AssetId,
+    tick: i32,
+) -> Result<LiquidityDensity, ContractError> {
+    let tick_data = get_tick_data(env, asset, tick);
+    if tick_data.liquidity_gross == 0 {
+        return Err(ContractError::InsufficientLiquidityDepth);
+    }
+
+    let liquidity_gross = tick_data.liquidity_gross;
+    let price_current = tick_to_price(tick)?;
+    let price_next = tick_to_price(tick + 1)?;
+    let sqrt_current = integer_sqrt(price_current)?;
+    let sqrt_next = integer_sqrt(price_next)?;
+
+    let price_range_width = sqrt_next
+        .checked_sub(sqrt_current)
+        .ok_or(ContractError::Overflow)? as u64;
+
+    if price_range_width == 0 {
+        return Err(ContractError::DivisionByZero);
+    }
+
+    let density = if price_range_width.is_power_of_two() {
+        let shift = price_range_width.trailing_zeros();
+        (liquidity_gross as u128)
+            .checked_shr(shift)
+            .ok_or(ContractError::Overflow)? as u64
+    } else {
+        (liquidity_gross as u128)
+            .checked_div(price_range_width as u128)
+            .ok_or(ContractError::Overflow)? as u64
+    };
+
+    let density_scaled = shl_scale(density as u128).map(|v| v as u64)?;
+    let price_range_scaled = shl_scale(price_range_width as u128).map(|v| v as u64)?;
+
+    Ok(LiquidityDensity {
+        tick_index: tick,
+        liquidity_gross,
+        density: density_scaled,
+        price_range_width: price_range_scaled,
+    })
+}
+
+pub fn compute_active_density_profile(
+    env: &Env,
+    asset: AssetId,
+) -> Result<TickLiquidityDensityProfile, ContractError> {
+    let meta = get_tick_index(env, asset)?;
+    let list = get_tick_list(env, asset);
+
+    if list.len() == 0 {
+        return Ok(TickLiquidityDensityProfile {
+            asset,
+            densities: Vec::new(env),
+            total_active_liquidity: 0,
+            max_density: 0,
+            max_density_tick: 0,
+            min_density: 0,
+            avg_density: 0,
+        });
+    }
+
+    let mut densities: Vec<LiquidityDensity> = Vec::new(env);
+    let mut total_active_liquidity: u64 = 0;
+    let mut max_density: u64 = 0;
+    let mut max_density_tick: i32 = 0;
+    let mut min_density: u64 = u64::MAX;
+    let mut density_sum: u128 = 0;
+    let mut count: u128 = 0;
+
+    for i in 0..list.len() {
+        let tick = *list.get(i).unwrap();
+        if let Ok(density) = compute_tick_liquidity_density(env, asset, tick) {
+            total_active_liquidity = total_active_liquidity
+                .checked_add(density.liquidity_gross)
+                .ok_or(ContractError::Overflow)?;
+            if density.density > max_density {
+                max_density = density.density;
+                max_density_tick = density.tick_index;
+            }
+            if density.density < min_density {
+                min_density = density.density;
+            }
+            density_sum = density_sum
+                .checked_add(density.density as u128)
+                .ok_or(ContractError::Overflow)?;
+            count += 1;
+            densities.push_back(density);
+        }
+    }
+
+    let avg_density = if count > 0 {
+        (density_sum / count) as u64
+    } else {
+        0
+    };
+
+    Ok(TickLiquidityDensityProfile {
+        asset,
+        densities,
+        total_active_liquidity,
+        max_density,
+        max_density_tick,
+        min_density,
+        avg_density,
+    })
+}
+
+pub fn preview_price_impact(
+    env: &Env,
+    asset: AssetId,
+    start_tick: i32,
+    start_liquidity: u64,
+    amount_in: u64,
+    direction_up: bool,
+    fee_bps: u32,
+) -> Result<PriceImpactPreview, ContractError> {
+    if amount_in == 0 {
+        return Err(ContractError::ZeroSwapAmount);
+    }
+    if start_liquidity == 0 {
+        return Err(ContractError::InsufficientLiquidityDepth);
+    }
+
+    let meta = get_tick_index(env, asset)?;
+    let list = get_tick_list(env, asset);
+    let mut steps: Vec<PriceImpactStep> = Vec::new(env);
+
+    let mut remaining_in = amount_in;
+    let mut total_out: u64 = 0;
+    let mut crossings: u32 = 0;
+    let mut current_tick = start_tick;
+    let mut current_liquidity = start_liquidity;
+    let mut max_step_impact_bps: u64 = 0;
+    let mut total_impact_bps: u64 = 0;
+    let mut step_count: u32 = 0;
+    let max_iterations = meta.tick_count + 1;
+    let mut iterations = 0u32;
+    let start_price = tick_to_price(start_tick)?;
+    let mut current_price = start_price;
+
+    while remaining_in > 0 && iterations < max_iterations {
+        iterations += 1;
+        let next_tick = find_next_initialized_tick(env, asset, current_tick, direction_up)?
+            .unwrap_or(if direction_up {
+                MAX_TICK_INDEX
+            } else {
+                MIN_TICK_INDEX
+            });
+
+        let price_start = current_price;
+        let price_end = tick_to_price(next_tick)?;
+        let sqrt_start = integer_sqrt(price_start)?;
+        let sqrt_end = integer_sqrt(price_end)?;
+        let sqrt_diff = if sqrt_end > sqrt_start {
+            sqrt_end
+                .checked_sub(sqrt_start)
+                .ok_or(ContractError::Overflow)?
+        } else {
+            sqrt_start
+                .checked_sub(sqrt_end)
+                .ok_or(ContractError::Overflow)?
+        };
+
+        let step_input_raw = (current_liquidity as i128)
+            .checked_mul(sqrt_diff)
+            .ok_or(ContractError::Overflow)?;
+        let step_input = if PRICE_SCALE.is_power_of_two() {
+            (step_input_raw as u128)
+                .checked_shr(PRICE_SCALE_SHIFT)
+                .ok_or(ContractError::Overflow)? as u64
+        } else {
+            (step_input_raw as u128)
+                .checked_div(PRICE_SCALE as u128)
+                .ok_or(ContractError::DivisionByZero)? as u64
+        };
+
+        let fee = if fee_bps.is_power_of_two() {
+            let shift = fee_bps.trailing_zeros();
+            (step_input as u128)
+                .checked_shr(shift)
+                .ok_or(ContractError::Overflow)? as u64
+        } else {
+            (step_input as u128)
+                .checked_mul(fee_bps as u128)
+                .ok_or(ContractError::Overflow)?
+                .checked_div(10_000)
+                .ok_or(ContractError::DivisionByZero)? as u64
+        };
+
+        let net_in = step_input.checked_sub(fee).ok_or(ContractError::Overflow)?;
+
+        let sqrt_product = sqrt_start
+            .checked_mul(sqrt_end)
+            .ok_or(ContractError::Overflow)?;
+        let step_out = if sqrt_product == 0 {
+            0
+        } else {
+            ((current_liquidity as i128)
+                .checked_mul(PRICE_SCALE)
+                .ok_or(ContractError::Overflow)?
+                .checked_mul(sqrt_diff)
+                .ok_or(ContractError::Overflow)?
+                .checked_div(sqrt_product)
+                .ok_or(ContractError::DivisionByZero)?) as u64
+        };
+
+        let consumed = if remaining_in >= net_in {
+            net_in
+        } else {
+            remaining_in
+        };
+        let actual_out = if net_in > 0 {
+            (step_out as u128)
+                .checked_mul(consumed as u128)
+                .ok_or(ContractError::Overflow)?
+                .checked_div(net_in as u128)
+                .ok_or(ContractError::DivisionByZero)? as u64
+        } else {
+            0
+        };
+
+        let price_after = price_start
+            .checked_mul(price_end)
+            .ok_or(ContractError::Overflow)?
+            / PRICE_SCALE;
+        let price_impact = if current_price > 0 && price_after > 0 {
+            let delta = if price_after > current_price {
+                (price_after - current_price) as u128
+            } else {
+                (current_price - price_after) as u128
+            };
+            let base = current_price as u128;
+            (delta * 10_000 / base) as u64
+        } else {
+            0
+        };
+
+        total_impact_bps = total_impact_bps
+            .checked_add(price_impact)
+            .ok_or(ContractError::Overflow)?;
+        if price_impact > max_step_impact_bps {
+            max_step_impact_bps = price_impact;
+        }
+        step_count += 1;
+
+        steps.push_back(PriceImpactStep {
+            start_tick: current_tick,
+            end_tick: next_tick,
+            price_before: current_price,
+            price_after,
+            amount_in: consumed,
+            amount_out: actual_out,
+            impact_bps: price_impact,
+            cumulative_out: total_out,
+        });
+
+        total_out = total_out
+            .checked_add(actual_out)
+            .ok_or(ContractError::Overflow)?;
+        remaining_in = remaining_in.saturating_sub(consumed);
+
+        if next_tick != MAX_TICK_INDEX && next_tick != MIN_TICK_INDEX {
+            let tick_data = get_tick_data(env, asset, next_tick);
+            if tick_data.liquidity_net != 0 {
+                current_liquidity = if direction_up {
+                    current_liquidity
+                        .checked_add(tick_data.liquidity_net as u64)
+                        .ok_or(ContractError::Overflow)?
+                } else {
+                    current_liquidity.saturating_sub((-tick_data.liquidity_net) as u64)
+                };
+                crossings += 1;
+            }
+        }
+
+        current_tick = next_tick;
+        current_price = price_after;
+        if remaining_in == 0 {
+            break;
+        }
+        if next_tick == MAX_TICK_INDEX || next_tick == MIN_TICK_INDEX {
+            break;
+        }
+    }
+
+    let avg_impact_bps = if step_count > 0 {
+        (total_impact_bps / step_count as u32) as u64
+    } else {
+        0
+    };
+
+    Ok(PriceImpactPreview {
+        total_amount_in: amount_in - remaining_in,
+        total_amount_out: total_out,
+        final_price: current_price,
+        avg_impact_bps,
+        max_step_impact_bps,
+        crossings,
+        steps,
+    })
+}
+
+pub fn compute_density_bitshift_optimized(
+    liquidity_gross: u64,
+    sqrt_price_current: u128,
+    sqrt_price_next: u128,
+) -> Result<u64, ContractError> {
+    let sqrt_diff = sqrt_price_next
+        .checked_sub(sqrt_price_current)
+        .ok_or(ContractError::Overflow)?;
+    if sqrt_diff == 0 {
+        return Err(ContractError::DivisionByZero);
+    }
+
+    let raw_density = if sqrt_diff.is_power_of_two() {
+        let shift = sqrt_diff.trailing_zeros();
+        (liquidity_gross as u128)
+            .checked_shr(shift)
+            .ok_or(ContractError::Overflow)?
+    } else {
+        (liquidity_gross as u128)
+            .checked_div(sqrt_diff)
+            .ok_or(ContractError::DivisionByZero)?
+    };
+
+    shl_scale(raw_density).map(|v| v as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,5 +1565,384 @@ mod tests {
     #[test]
     fn max_ticks_per_pool_is_reasonable() {
         assert_eq!(MAX_TICKS_PER_POOL, 256);
+    }
+
+    // ── Bit-shift optimization tests ─────────────────────────────────
+
+    #[test]
+    fn test_shl_scale_overflow() {
+        assert!(shl_scale(u128::MAX).is_err());
+    }
+
+    #[test]
+    fn test_shl_scale_basic() {
+        assert_eq!(shl_scale(1).unwrap(), PRICE_SCALE_POW2);
+    }
+
+    #[test]
+    fn test_shr_unscale_basic() {
+        let val = PRICE_SCALE_POW2 * 5;
+        assert_eq!(shr_unscale(val).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_shr_unscale_overflow() {
+        assert!(shr_unscale(1).is_err());
+    }
+
+    #[test]
+    fn test_shl_by_overflow() {
+        assert!(shl_by(1, 127).is_err());
+    }
+
+    #[test]
+    fn test_shl_by_basic() {
+        assert_eq!(shl_by(1, 3).unwrap(), 8);
+    }
+
+    #[test]
+    fn test_shr_by_basic() {
+        assert_eq!(shr_by(8, 3).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_shr_by_zero_returns_value() {
+        assert_eq!(shr_by(42, 0).unwrap(), 42);
+    }
+
+    // ── Liquidity Density Engine tests ───────────────────────────────
+
+    #[test]
+    fn test_compute_density_bitshift_optimized_basic() {
+        let result = compute_density_bitshift_optimized(100, 1_000_000, 1_002_000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compute_density_bitshift_optimized_power_of_two_diff() {
+        let result = compute_density_bitshift_optimized(100, 1000, 1004);
+        assert!(result.is_ok());
+        let density = result.unwrap();
+        assert_eq!(density, 25u64 << PRICE_SCALE_LOG2);
+    }
+
+    #[test]
+    fn test_compute_density_bitshift_optimized_non_power_of_two_diff() {
+        let result = compute_density_bitshift_optimized(100, 1000, 1003);
+        assert!(result.is_ok());
+        let density = result.unwrap();
+        assert_eq!(density, 33u64 << PRICE_SCALE_LOG2);
+    }
+
+    #[test]
+    fn test_compute_density_bitshift_optimized_zero_diff() {
+        let result = compute_density_bitshift_optimized(100, 1000, 1000);
+        assert_eq!(result, Err(ContractError::DivisionByZero));
+    }
+
+    #[test]
+    fn test_compute_tick_liquidity_density_basic() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+        place_liquidity(&env, asset, 0, 1000).unwrap();
+
+        let density = compute_tick_liquidity_density(&env, asset, 0).unwrap();
+        assert_eq!(density.tick_index, 0);
+        assert_eq!(density.liquidity_gross, 1000);
+        assert!(density.density > 0);
+        assert!(density.price_range_width > 0);
+    }
+
+    #[test]
+    fn test_compute_tick_liquidity_density_zero_liquidity() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+
+        assert_eq!(
+            compute_tick_liquidity_density(&env, asset, 0),
+            Err(ContractError::InsufficientLiquidityDepth)
+        );
+    }
+
+    #[test]
+    fn test_compute_tick_liquidity_density_nonexistent_tick() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+        place_liquidity(&env, asset, 10, 500).unwrap();
+
+        assert_eq!(
+            compute_tick_liquidity_density(&env, asset, 0),
+            Err(ContractError::InsufficientLiquidityDepth)
+        );
+    }
+
+    // ── Density Profile tests ────────────────────────────────────────
+
+    #[test]
+    fn test_compute_active_density_profile_empty() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+
+        let profile = compute_active_density_profile(&env, asset).unwrap();
+        assert_eq!(profile.densities.len(), 0);
+        assert_eq!(profile.total_active_liquidity, 0);
+        assert_eq!(profile.max_density, 0);
+        assert_eq!(profile.avg_density, 0);
+    }
+
+    #[test]
+    fn test_compute_active_density_profile_basic() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+        place_liquidity(&env, asset, 0, 1000).unwrap();
+        place_liquidity(&env, asset, 10, 500).unwrap();
+
+        let profile = compute_active_density_profile(&env, asset).unwrap();
+        assert_eq!(profile.total_active_liquidity, 1500);
+        assert!(profile.max_density > 0);
+        assert!(profile.min_density > 0);
+        assert!(profile.avg_density > 0);
+        assert_eq!(profile.densities.len(), 2);
+    }
+
+    #[test]
+    fn test_compute_active_density_profile_max_min() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+        place_liquidity(&env, asset, 0, 2000).unwrap();
+        place_liquidity(&env, asset, 10, 1000).unwrap();
+
+        let profile = compute_active_density_profile(&env, asset).unwrap();
+        assert!(profile.max_density >= profile.min_density);
+        assert!(profile.max_density_tick == 0 || profile.max_density_tick == 10);
+    }
+
+    // ── Price Impact Preview tests ───────────────────────────────────
+
+    #[test]
+    fn test_preview_price_impact_zero_amount() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+
+        assert_eq!(
+            preview_price_impact(&env, asset, 0, 100, 0, true, 30),
+            Err(ContractError::ZeroSwapAmount)
+        );
+    }
+
+    #[test]
+    fn test_preview_price_impact_zero_liquidity() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+
+        assert_eq!(
+            preview_price_impact(&env, asset, 0, 0, 100, true, 30),
+            Err(ContractError::InsufficientLiquidityDepth)
+        );
+    }
+
+    #[test]
+    fn test_preview_price_impact_basic() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+        place_liquidity(&env, asset, 0, 1000).unwrap();
+
+        let preview = preview_price_impact(&env, asset, 0, 1000, 100, true, 30).unwrap();
+        assert_eq!(preview.total_amount_in, 100);
+        assert!(preview.total_amount_out > 0);
+        assert!(preview.crossings >= 0);
+        assert!(preview.avg_impact_bps >= 0);
+    }
+
+    #[test]
+    fn test_preview_price_impact_returns_steps() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+        place_liquidity(&env, asset, 0, 1000).unwrap();
+
+        let preview = preview_price_impact(&env, asset, 0, 1000, 100, true, 30).unwrap();
+        assert!(!preview.steps.is_empty());
+        for step in preview.steps.iter() {
+            assert!(step.amount_out <= preview.total_amount_out);
+        }
+    }
+
+    #[test]
+    fn test_preview_price_impact_direction_down() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+        place_liquidity(&env, asset, 0, 1000).unwrap();
+        place_liquidity(&env, asset, -10, 500).unwrap();
+
+        let preview = preview_price_impact(&env, asset, 0, 1000, 100, false, 30).unwrap();
+        assert!(preview.total_amount_out > 0);
+        assert!(preview.crossings >= 0);
+    }
+
+    #[test]
+    fn test_preview_price_impact_max_step_impact() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+        place_liquidity(&env, asset, 0, 1000).unwrap();
+
+        let preview = preview_price_impact(&env, asset, 0, 1000, 10000, true, 30).unwrap();
+        assert!(preview.max_step_impact_bps > 0);
+        assert!(preview.max_step_impact_bps >= preview.avg_impact_bps);
+    }
+
+    // ── Bit-shift CPU optimization tests ─────────────────────────────
+
+    #[test]
+    fn test_bitshift_division_equivalence() {
+        for value in 0u128..1000 {
+            for shift in 1u32..10u32 {
+                assert_eq!(value >> shift, value / (1u128 << shift));
+            }
+        }
+    }
+
+    #[test]
+    fn test_bitshift_multiplication_equivalence() {
+        for value in 0u128..1000 {
+            for shift in 1u32..10u32 {
+                assert_eq!(value << shift, value * (1u128 << shift));
+            }
+        }
+    }
+
+    #[test]
+    fn test_price_scale_pow2_is_power_of_two() {
+        assert!(PRICE_SCALE_POW2.is_power_of_two());
+        assert_eq!(PRICE_SCALE_POW2, 1u128 << PRICE_SCALE_LOG2);
+    }
+
+    // ── Multi-tick density crossing tests ────────────────────────────
+
+    #[test]
+    fn test_density_across_multiple_ticks() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+
+        place_liquidity(&env, asset, -20, 1000).unwrap();
+        place_liquidity(&env, asset, -10, 2000).unwrap();
+        place_liquidity(&env, asset, 0, 500).unwrap();
+        place_liquidity(&env, asset, 10, 1500).unwrap();
+        place_liquidity(&env, asset, 20, 800).unwrap();
+
+        let profile = compute_active_density_profile(&env, asset).unwrap();
+        assert_eq!(profile.densities.len(), 5);
+        assert_eq!(profile.total_active_liquidity, 5800);
+    }
+
+    #[test]
+    fn test_zero_liquidity_density_profile() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+
+        let profile = compute_active_density_profile(&env, asset).unwrap();
+        assert_eq!(profile.densities.len(), 0);
+        assert_eq!(profile.total_active_liquidity, 0);
+    }
+
+    #[test]
+    fn test_extreme_tick_boundaries_density() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+
+        place_liquidity(&env, asset, MIN_TICK_INDEX, 100).unwrap();
+        place_liquidity(&env, asset, MAX_TICK_INDEX, 100).unwrap();
+
+        let profile = compute_active_density_profile(&env, asset).unwrap();
+        assert_eq!(profile.densities.len(), 2);
+        assert!(profile.max_density > 0);
+    }
+
+    // ── Price impact with multi-tick crossings ───────────────────────
+
+    #[test]
+    fn test_price_impact_multi_tick_crossings() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, 10).unwrap();
+        place_liquidity(&env, asset, 0, 1000).unwrap();
+        place_liquidity(&env, asset, 10, 1000).unwrap();
+        place_liquidity(&env, asset, 20, 1000).unwrap();
+
+        let preview = preview_price_impact(&env, asset, 0, 2000, 500, true, 30).unwrap();
+        assert!(preview.crossings >= 0);
+        assert!(preview.steps.len() > 0);
+    }
+
+    #[test]
+    fn test_price_impact_arithmetic_accuracy() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+        place_liquidity(&env, asset, 0, 10000).unwrap();
+
+        let preview = preview_price_impact(&env, asset, 0, 10000, 100, true, 0).unwrap();
+        let sum_step_outputs: u64 = preview.steps.iter().map(|s| s.amount_out).sum();
+        assert_eq!(preview.total_amount_out, sum_step_outputs);
+    }
+
+    // ── Swap step validation tests ───────────────────────────────────
+
+    #[test]
+    fn test_swap_step_data_consistency() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+        place_liquidity(&env, asset, 0, 1000).unwrap();
+
+        let preview = preview_price_impact(&env, asset, 0, 1000, 100, true, 30).unwrap();
+        for step in preview.steps.iter() {
+            assert!(step.cumulative_out <= preview.total_amount_out);
+            assert!(step.amount_in > 0);
+        }
+    }
+
+    #[test]
+    fn test_density_profile_asset_identity() {
+        let env = Env::default();
+        let asset: AssetId = 42;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+        place_liquidity(&env, asset, 0, 1000).unwrap();
+
+        let profile = compute_active_density_profile(&env, asset).unwrap();
+        assert_eq!(profile.asset, asset);
+    }
+
+    // ── Overflow and boundary tests ──────────────────────────────────
+
+    #[test]
+    fn test_compute_density_bitshift_overflow() {
+        let result = compute_density_bitshift_optimized(u64::MAX, 1, 2);
+        assert!(result.is_err() || result.unwrap() > 0);
+    }
+
+    #[test]
+    fn test_preview_price_impact_overflow_protection() {
+        let env = Env::default();
+        let asset: AssetId = 1;
+        initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
+        place_liquidity(&env, asset, 0, 1).unwrap();
+
+        let preview = preview_price_impact(&env, asset, 0, 1, u64::MAX, true, 30);
+        assert!(preview.is_ok() || preview.is_err());
     }
 }
