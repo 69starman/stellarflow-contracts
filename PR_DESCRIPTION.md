@@ -149,3 +149,43 @@ cargo test -p gas-tank
 # 10 passed; 0 failed
 ```
 
+---
+
+## PR 4 — feat/vault-multi-collateral-basket-liquidation-health-inspector
+
+**Title:** `feat: add TWAP-based vault health monitor`
+**Branch:** `Implement-Vault-Multi-Collateral-Basket-Liquidation-Health-Inspector`
+**Base:** `main`
+
+### Summary
+
+Adds a Soroban contract that inspects vault snapshots containing multiple collateral assets, computes a consolidated health factor from oracle TWAPs, and returns a partial liquidation plan when the position is below 1.0 health.
+
+### Motivation
+
+Vaults with mixed collateral need a single risk measure that accounts for each asset's price and collateral factor. The monitor provides a consistent health check and prioritizes lower-factor, higher-risk assets when it emits liquidation instructions.
+
+### Changes
+
+**`Cargo.toml`**
+- Registered `contracts/vault-health-monitor` as a workspace member.
+
+**`contracts/vault-health-monitor` [NEW]**
+- Added an `inspect` entrypoint that reads TWAPs for each collateral asset and the debt asset.
+- Computes adjusted collateral value as `sum(amount * TWAP * multiplier_bps / 10000)`, debt value, and health factor in basis points. A value of `10000` represents a health factor of `1.0`.
+- Validates positive amounts and prices, collateral multipliers, missing TWAPs, and checked arithmetic.
+- For unhealthy positions, plans partial liquidation in ascending multiplier order and emits a `liquidation` event for each step. The monitor returns instructions; token transfers and repayment execution are handled externally.
+- Added tests for healthy basket valuation and risk-ordered partial liquidation.
+
+### Testing
+
+```bash
+cargo test -p vault-health-monitor
+# 2 passed; 0 failed
+
+cargo fmt --manifest-path contracts/vault-health-monitor/Cargo.toml -- --check
+# Passed
+```
+
+`cargo test --workspace` remains blocked by compile errors in the existing `contracts/reward-splitter` tests, which use unavailable Soroban test APIs.
+
