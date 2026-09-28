@@ -262,6 +262,8 @@ pub enum ContractError {
     InvalidFeeSplitConfig = 82,
     /// A fee allocation does not add up to the original total.
     FeeDistributionMismatch = 83,
+    /// Public inputs to zero-knowledge proof do not match contract state parameters.
+    InvalidZKPublicInputs = 84,
 }
 
 impl ContractError {
@@ -2402,6 +2404,28 @@ impl TimeLockedUpgradeContract {
         bridge::relayer::remove_validator(&env, &admin, pubkey)
     }
 
+    /// Stake collateral deposit for an active bridge validator (Issue #959).
+    pub fn stake_bridge_validator(
+        env: Env,
+        validator: BytesN<32>,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        bridge::slashing::stake_validator_collateral(&env, &validator, amount)
+    }
+
+    /// Get current staked collateral deposit for a bridge validator (Issue #959).
+    pub fn get_bridge_validator_collateral(env: Env, validator: BytesN<32>) -> i128 {
+        bridge::slashing::get_validator_collateral(&env, &validator)
+    }
+
+    /// Submit cryptographic double-sign proof to slash offending validator 100% and ban permanently (Issue #959).
+    pub fn submit_double_sign_proof(
+        env: Env,
+        proof: bridge::slashing::DoubleSignProof,
+    ) -> Result<i128, ContractError> {
+        bridge::slashing::process_double_sign_proof(&env, &proof)
+    }
+
     // --- Native bridge escrow (Issue #750) ---
 
     pub fn configure_bridge_escrow(
@@ -3054,6 +3078,25 @@ impl TimeLockedUpgradeContract {
         )>,
     ) -> Result<Vec<zk::verifier::VerificationResult>, ContractError> {
         zk::verifier::batch_verify_proofs(&env, &proofs)
+    }
+
+    /// Verify ZK proof public inputs guard for deposit notes against contract state (Issue #981).
+    pub fn verify_zk_deposit_public_inputs(
+        env: Env,
+        public_inputs: zk::public_input_guard::DepositNotePublicInputs,
+        submitted_params: zk::public_input_guard::SubmittedDepositParameters,
+    ) -> Result<(), ContractError> {
+        zk::public_input_guard::verify_deposit_public_inputs(&env, &public_inputs, &submitted_params)
+    }
+
+    /// Compute dynamic swap fee fswap = fbase + (Vsigma * fscalar) constrained to fswap <= 0.01 (Issue #930).
+    pub fn compute_adaptive_swap_fee(
+        env: Env,
+        f_base: u32,
+        v_sigma: u32,
+        f_scalar: u32,
+    ) -> Result<u32, ContractError> {
+        amm::adaptive_fee::compute_oracle_volatility_fee(f_base, v_sigma, f_scalar)
     }
 
 #[cfg(test)]
