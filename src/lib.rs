@@ -84,6 +84,7 @@ pub mod math;
 pub mod oracle_attestation;
 pub mod orders;
 pub mod recovery;
+pub mod remittance;
 pub mod rescue;
 pub mod roles;
 pub mod router;
