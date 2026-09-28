@@ -77,6 +77,8 @@ pub use kernel::instance;
 pub mod errors;
 pub mod events;
 pub mod fees;
+pub mod flash_fee_engine;
+pub mod flash_loan_guard;
 pub mod temp_governance;
 use crate::validation::check_bond_capacity;
 pub mod governance;
@@ -98,6 +100,7 @@ pub mod temp_governance;
 pub mod token;
 pub mod upgrades;
 pub mod validation;
+pub mod vaults;
 pub mod zk;
 pub use state_verification::{
     assert_contract_state_sanity, verify_contract_state, verify_storage_ttl_bumps,
@@ -262,6 +265,13 @@ pub enum ContractError {
     InvalidFeeSplitConfig = 82,
     /// A fee allocation does not add up to the original total.
     FeeDistributionMismatch = 83,
+    /// Caller is not the designated emergency guardian (Issue #927).
+    NotEmergencyGuardian = 88,
+    /// Vault dynamic debt accounting is out of balance (Issue #918).
+    VaultDebtImbalance = 89,
+    /// Flash loan repayment did not cover principal plus the dynamic fee
+    /// (Issue #902).
+    InsufficientFlashLoanRepayment = 90,
 }
 
 impl ContractError {
@@ -1110,6 +1120,30 @@ impl TimeLockedUpgradeContract {
         fees::distribute_flash_fees(&env, &caller, asset)
     }
 
+    // ── Flash Loan Arbitrage Fee Multiplier Engine (Issue #902) ────────────
+
+    /// Compute the dynamic flash-loan protocol fee scalar:
+    /// `f_fee = f_base + (L_borrowed / L_pool) × f_premium`.
+    pub fn quote_flash_loan_fee(
+        base_bps: u32,
+        premium_bps: u32,
+        borrowed: i128,
+        pool: i128,
+    ) -> Result<flash_fee_engine::FlashLoanFeeQuote, ContractError> {
+        flash_fee_engine::compute_flash_loan_fee(base_bps, premium_bps, borrowed, pool)
+    }
+
+    /// Verify that a flash-loan repayment clears the dynamic fee threshold:
+    /// `B_return >= B_borrowed × (1 + f_fee)`. Reverts with
+    /// [`ContractError::InsufficientFlashLoanRepayment`] when it does not.
+    pub fn verify_flash_loan_repayment(
+        borrowed: i128,
+        returned: i128,
+        fee_bps: u32,
+    ) -> Result<(), ContractError> {
+        flash_fee_engine::assert_flash_repayment(borrowed, returned, fee_bps)
+    }
+
     /// Get the current dynamic trading fee for an asset (in basis points)
     pub fn get_current_dynamic_fee(env: Env, asset: AssetId) -> u32 {
         crate::fees::get_current_dynamic_fee(&env, asset)
@@ -1472,6 +1506,37 @@ impl TimeLockedUpgradeContract {
         proposal_id: u64,
     ) -> bool {
         governance::is_proposal_executable(&env, proposal_id)
+    }
+
+    // ── Multi-Sig Proposal Cancellation by Emergency Guardian (Issue #927) ──
+
+    /// Return the currently designated emergency guardian, if any.
+    pub fn get_emergency_guardian(env: Env) -> Option<Address> {
+        governance::get_emergency_guardian(&env)
+    }
+
+    /// Designate (or rotate) the emergency guardian address (admin only).
+    ///
+    /// The guardian may unilaterally nullify active administrative proposals
+    /// without waiting for a multi-sig quorum.
+    pub fn designate_emergency_guardian(
+        env: Env,
+        admin: Address,
+        guardian: Address,
+    ) -> Result<(), ContractError> {
+        governance::designate_emergency_guardian(&env, admin, guardian)
+    }
+
+    /// Emergency-guardian nullification of an active governance proposal.
+    ///
+    /// Nullifies the pending proposal and permanently removes its unexecuted
+    /// `wasm_hash` from persistent state before the timelock expires.
+    pub fn emergency_cancel_governance_proposal(
+        env: Env,
+        guardian: Address,
+        proposal_id: u64,
+    ) -> Result<(), ContractError> {
+        governance::emergency_cancel_proposal(&env, guardian, proposal_id)
     }
 
     // ── Emergency Key Revocation (multi-sig coordinator group) ───────────────

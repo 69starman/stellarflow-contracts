@@ -15,6 +15,14 @@ pub enum DataKey {
     Remittance(u64),
     /// The collateral balance (in token stroops) currently staked by an anchor.
     Collateral(Address),
+    /// The protocol treasury address that receives 20% bond slashes (Issue #929).
+    Treasury,
+    /// Instance-storage lock flag: `true` while the anchor has active
+    /// settlement tasks (pending remittances) keeping its bond locked (Issue #929).
+    BondLocked(Address),
+    /// Instance-storage counter of active (Pending) settlement tasks per anchor
+    /// (Issue #929).
+    PendingRemittances(Address),
 }
 
 /// Lifecycle status of a remittance.

@@ -1,4 +1,5 @@
 pub mod autocompound;
+pub mod debt_share;
 pub mod liquidation;
 pub mod lp_farming;
 pub mod pause_guard;
