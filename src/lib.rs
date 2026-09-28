@@ -275,6 +275,26 @@ impl ContractError {
     pub const BridgeSupplyCapExceeded: Self = Self::Overflow;
     pub const BridgeInsufficientBalance: Self = Self::Overflow;
     pub const BridgeEscrowNotConfigured: Self = Self::NotInitialized;
+
+    // ── Bridge wrapped supply cap guard (Issue #1009) ─────────────────────
+    // Semantic aliases only, matching the `Bridge*` and `Harvest*` conventions
+    // above. No new `#[contracterror]` variants: that enum is already at 82
+    // cases against the soroban-sdk 20 cap of 50, so each new error is an alias
+    // rather than another variant.
+    /// A mint would push wrapped supply past the collateral-backed cap.
+    pub const BridgeCapExceeded: Self = Self::InsufficientReserveBalance;
+    /// Verified locked collateral is insufficient to cover the active wrapped
+    /// supply, or is smaller than a requested release.
+    pub const BridgeCapUndercollateralized: Self = Self::InsufficientReserveBalance;
+    /// A release or reconciliation asked for more than is recorded.
+    pub const BridgeCapInsufficientCollateral: Self = Self::InsufficientReserveBalance;
+    /// A locked-collateral figure was negative, which is not an observation.
+    pub const BridgeCapInvalidCollateral: Self = Self::InvalidArgument;
+    /// A configured capacity ratio fell outside its permitted bounds.
+    pub const BridgeCapInvalidConfig: Self = Self::InvalidVarianceConfig;
+    /// A supply delta, release amount or observed total was not strictly
+    /// positive, or reconciliation tried to lower the mirrored supply.
+    pub const BridgeCapInvalidAmount: Self = Self::AmountTooLow;
     pub const AdminChangeTimelockNotSatis: Self = Self::UpgradeTimelockNotSatisfied;
     pub const StagingNotAuthorized: Self = Self::Unauthorized;
     pub const EmptyRoute: Self = Self::AmountTooLow;
@@ -1978,6 +1998,127 @@ impl TimeLockedUpgradeContract {
     ) -> Result<vaults::harvest_compound::HarvestCompoundResult, ContractError> {
         let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
         vaults::harvest_compound::harvest_and_compound(&env, user, router, path, min_lp_out)
+    }
+
+    // ── Bridge wrapped supply dynamic cap guard (Issue #1009) ──────────────
+    //
+    // Replaces `bridge::mint`'s static `max_supply` ceiling with one derived
+    // from verified locked collateral, so the cap moves with the backing:
+    // a mint is refused when `S_wrapped + ΔS > C_locked * capacity_bps / 10_000`.
+
+    /// Configure — or reconfigure — the collateral-backed cap for a wrapped
+    /// asset. `capacity_bps` is capped at 100 % so the guard can never be set to
+    /// permit more supply than there is collateral.
+    pub fn configure_bridge_cap_guard(
+        env: Env,
+        admin: Address,
+        asset_code: Symbol,
+        verifier: Address,
+        capacity_bps: i64,
+    ) -> Result<bridge::cap_guard::BridgeCapConfig, ContractError> {
+        bridge::cap_guard::configure_cap_guard(&env, &admin, &asset_code, &verifier, capacity_bps)
+    }
+
+    /// Guard for mint paths: fail unless `delta_supply` fits under the
+    /// collateral-backed ceiling. Emits `BridgeCapExceeded` on a breach.
+    pub fn require_bridge_mint_allowed(
+        env: Env,
+        asset_code: Symbol,
+        delta_supply: i128,
+    ) -> Result<(), ContractError> {
+        bridge::cap_guard::require_mint_allowed(&env, &asset_code, delta_supply)
+    }
+
+    /// Apply the cap and mirror the supply move in one step. Refuses with
+    /// [`ContractError::BridgeCapExceeded`] when the mint would exceed the cap.
+    pub fn mint_bridge_wrapped_within_cap(
+        env: Env,
+        verifier: Address,
+        asset_code: Symbol,
+        delta_supply: i128,
+    ) -> Result<i128, ContractError> {
+        bridge::cap_guard::mint_within_cap(&env, &verifier, &asset_code, delta_supply)
+    }
+
+    /// Record newly verified locked collateral, which re-opens mint headroom.
+    pub fn deposit_bridge_locked_collateral(
+        env: Env,
+        verifier: Address,
+        asset_code: Symbol,
+        amount: i128,
+    ) -> Result<i128, ContractError> {
+        bridge::cap_guard::deposit_locked_collateral(&env, &verifier, &asset_code, amount)
+    }
+
+    /// Release locked collateral. Refused when it would leave less locked than
+    /// the live wrapped supply.
+    pub fn release_bridge_locked_collateral(
+        env: Env,
+        admin: Address,
+        asset_code: Symbol,
+        amount: i128,
+    ) -> Result<i128, ContractError> {
+        bridge::cap_guard::release_locked_collateral(&env, &admin, &asset_code, amount)
+    }
+
+    /// Mirror wrapped supply downward after a burn. The only path that lowers
+    /// `S_wrapped`.
+    pub fn record_bridge_wrapped_burn(
+        env: Env,
+        verifier: Address,
+        asset_code: Symbol,
+        delta_supply: i128,
+    ) -> Result<i128, ContractError> {
+        bridge::cap_guard::record_wrapped_burn(&env, &verifier, &asset_code, delta_supply)
+    }
+
+    /// Reconcile the mirrored supply against the mint engine's authoritative
+    /// `total_supply`. Tightens only; lowering requires a recorded burn.
+    pub fn sync_bridge_wrapped_supply(
+        env: Env,
+        asset_code: Symbol,
+        observed_total_supply: i128,
+    ) -> Result<i128, ContractError> {
+        bridge::cap_guard::sync_wrapped_supply(&env, &asset_code, observed_total_supply)
+    }
+
+    /// Read the collateral-backed cap snapshot: `S_wrapped`, `C_locked`, the
+    /// derived ceiling and remaining headroom.
+    pub fn get_bridge_cap_status(
+        env: Env,
+        asset_code: Symbol,
+    ) -> Result<bridge::cap_guard::BridgeCapStatus, ContractError> {
+        bridge::cap_guard::bridge_cap_status(&env, &asset_code)
+    }
+
+    /// Remaining mint headroom under the collateral-backed cap, floored at zero.
+    pub fn bridge_mint_headroom(env: Env, asset_code: Symbol) -> Result<i128, ContractError> {
+        bridge::cap_guard::mint_headroom(&env, &asset_code)
+    }
+
+    /// Derive the cap ceiling `floor(C_locked * capacity_bps / 10_000)` without
+    /// overflow.
+    pub fn bridge_allowed_supply(
+        locked_collateral: i128,
+        capacity_bps: i64,
+    ) -> Result<i128, ContractError> {
+        bridge::cap_guard::allowed_supply(locked_collateral, capacity_bps)
+    }
+
+    /// `true` when a mint of `delta_supply` would push wrapped supply past the
+    /// ceiling.
+    pub fn bridge_mint_exceeds_cap(
+        wrapped_supply: i128,
+        locked_collateral: i128,
+        capacity_bps: i64,
+        delta_supply: i128,
+    ) -> bool {
+        bridge::cap_guard::mint_exceeds_cap(
+            wrapped_supply,
+            locked_collateral,
+            capacity_bps,
+            delta_supply,
+        )
     }
 
     // ── On-chain limit order book (Issue #701) ───────────────────────────────
