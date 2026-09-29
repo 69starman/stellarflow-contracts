@@ -6,8 +6,17 @@ use crate::ContractError;
 pub const BPS_DENOMINATOR: u128 = 10_000;
 /// A vault is eligible for liquidation below 110% collateralization.
 pub const DEFAULT_LIQUIDATION_THRESHOLD_BPS: u32 = 11_000;
-/// Liquidators receive 5% of the confiscated collateral.
+/// Floor bonus: a liquidator receives at least this share of the confiscated
+/// collateral, even for a position sitting just below the threshold.
 pub const LIQUIDATOR_BONUS_BPS: u32 = 500;
+
+/// Extra bonus that scales in as the position degrades, reached in full at a
+/// health factor of zero.
+pub const MAX_LIQUIDATOR_DEGRADATION_BPS: u32 = 2_000;
+
+/// Hard ceiling on the liquidator's total share, so a bonus can never consume
+/// the whole position and leave the protocol reserve empty.
+pub const MAX_TOTAL_LIQUIDATOR_BPS: u32 = 5_000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +61,28 @@ fn threshold(position: &VaultPosition) -> u128 {
     }
 }
 
+/// Liquidator share for a position, in basis points (#932).
+///
+/// `P_liq = P_base + (1 - H) * P_bonus`
+///
+/// `health_factor_bps` is the ratio scaled by [`BPS_DENOMINATOR`], so 10_000 is
+/// 100% health. The degradation term is guarded rather than computed blindly:
+/// health can exceed 10_000 bps and still be liquidatable, because a position
+/// at 109% is under a 110% threshold, and an unsigned subtraction there would
+/// wrap to an enormous number.
+pub fn scaled_liquidator_bonus_bps(health_factor_bps: u128) -> u128 {
+    let base = LIQUIDATOR_BONUS_BPS as u128;
+
+    let degraded = if health_factor_bps >= BPS_DENOMINATOR {
+        0
+    } else {
+        ((BPS_DENOMINATOR - health_factor_bps) * MAX_LIQUIDATOR_DEGRADATION_BPS as u128)
+            / BPS_DENOMINATOR
+    };
+
+    core::cmp::min(base + degraded, MAX_TOTAL_LIQUIDATOR_BPS as u128)
+}
+
 pub fn liquidate(
     _env: &Env,
     position: &VaultPosition,
@@ -67,8 +98,12 @@ pub fn liquidate(
         });
     }
 
+    // The deeper underwater the position is, the larger the incentive a
+    // liquidator gets for taking it off the books.
+    let bonus_bps = scaled_liquidator_bonus_bps(hf);
+
     let reward = purchase_collateral
-        .checked_mul(LIQUIDATOR_BONUS_BPS as u128)
+        .checked_mul(bonus_bps)
         .ok_or(ContractError::MathOverflow)?
         .checked_div(BPS_DENOMINATOR)
         .ok_or(ContractError::DivisionByZero)?;
@@ -82,6 +117,24 @@ pub fn liquidate(
         liquidator_reward: reward,
         protocol_reserve,
     })
+}
+
+/// Zero-loss invariant for the liquidation ledger (#925).
+///
+/// Confiscated collateral is only ever split, never created or destroyed, so
+/// the liquidator reward plus the protocol reserve must equal exactly the
+/// collateral that entered the split. A non-liquidation must move nothing at
+/// all, otherwise a rejected liquidation would still book a transfer.
+pub fn conserves_collateral(result: &LiquidationResult, purchase_collateral: u128) -> bool {
+    if !result.liquidated {
+        return result.liquidator_reward == 0 && result.protocol_reserve == 0;
+    }
+
+    result
+        .liquidator_reward
+        .checked_add(result.protocol_reserve)
+        .map(|sum| sum == purchase_collateral)
+        .unwrap_or(false)
 }
 
 /// Price a vault using the oracle's verified `get_twap(Symbol)` feed before
