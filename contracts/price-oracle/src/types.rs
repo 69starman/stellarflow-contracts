@@ -145,6 +145,8 @@ pub enum DataKey {
     /// price and the consensus median.  Written on every `report_price_deviation`
     /// call for audit and off-chain indexing purposes.
     ProviderLastDeviationBps(Address),
+    /// Gas Tank escrow contract address for relayer reimbursement (Issue #266).
+    GasTank,
 }
 
 /// Decimal metadata for an asset pair.
