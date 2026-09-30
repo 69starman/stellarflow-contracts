@@ -11,6 +11,10 @@ pub enum DataKey {
     Initialized,
     /// Monotonically increasing counter used to allocate remittance ids.
     NextRemittanceId,
+    /// Monotonically increasing counter of emitted events. Every published
+    /// event allocates one id from here and carries it as an extra topic so
+    /// indexers can order and deduplicate events contract-wide.
+    NextEventSequenceId,
     /// A single remittance record, keyed by its id.
     Remittance(u64),
     /// The collateral balance (in token stroops) currently staked by an anchor.

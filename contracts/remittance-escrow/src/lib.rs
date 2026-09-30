@@ -188,6 +188,25 @@ fn checked_sub(a: i128, b: i128) -> Result<i128, Error> {
     a.checked_sub(b).ok_or(Error::ArithmeticOverflow)
 }
 
+/// Assign the next event sequence id and persist the incremented counter.
+///
+/// Every published event takes exactly one id from this persistent,
+/// monotonically increasing counter, so sequence ids are unique and strictly
+/// increasing across the contract's lifetime. Indexers use the id (carried as
+/// an extra event topic) to order and deduplicate events contract-wide.
+fn next_event_sequence_id(env: &Env) -> Result<u64, Error> {
+    let id: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::NextEventSequenceId)
+        .unwrap_or(0);
+    let next = id.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+    env.storage()
+        .persistent()
+        .set(&DataKey::NextEventSequenceId, &next);
+    Ok(id)
+}
+
 #[contractimpl]
 impl RemittanceEscrow {
     /// Initialize the contract with an admin and the SAC/SEP-41 token used
@@ -204,8 +223,9 @@ impl RemittanceEscrow {
             .set(&DataKey::NextRemittanceId, &0u64);
         env.storage().instance().set(&DataKey::Initialized, &true);
 
+        let seq = next_event_sequence_id(&env)?;
         env.events().publish(
-            (symbol_short!("cinit"),),
+            (symbol_short!("cinit"), seq),
             ContractInitializedEvent { admin, token },
         );
 
@@ -260,8 +280,9 @@ impl RemittanceEscrow {
         };
         set_remittance(&env, &remittance);
 
+        let seq = next_event_sequence_id(&env)?;
         env.events().publish(
-            (symbol_short!("remcreat"),),
+            (symbol_short!("remcreat"), seq),
             RemittanceCreatedEvent {
                 id,
                 sender,
@@ -299,8 +320,9 @@ impl RemittanceEscrow {
         remittance.proof = proof;
         set_remittance(&env, &remittance);
 
+        let seq = next_event_sequence_id(&env)?;
         env.events().publish(
-            (symbol_short!("paycomp"),),
+            (symbol_short!("paycomp"), seq),
             PayoutCompletedEvent {
                 id: remittance_id,
                 anchor,
@@ -328,8 +350,9 @@ impl RemittanceEscrow {
         let total = checked_add(current, amount)?;
         set_collateral_balance(&env, &anchor, total);
 
+        let seq = next_event_sequence_id(&env)?;
         env.events().publish(
-            (symbol_short!("coldep"),),
+            (symbol_short!("coldep"), seq),
             CollateralDepositedEvent {
                 anchor,
                 amount,
@@ -392,8 +415,9 @@ impl RemittanceEscrow {
         remittance.status = RemittanceStatus::Refunded;
         set_remittance(&env, &remittance);
 
+        let dispute_seq = next_event_sequence_id(&env)?;
         env.events().publish(
-            (symbol_short!("paydisp"),),
+            (symbol_short!("paydisp"), dispute_seq),
             PayoutDisputedEvent {
                 id: remittance_id,
                 sender: sender.clone(),
@@ -401,8 +425,9 @@ impl RemittanceEscrow {
                 locked_collateral: locked,
             },
         );
+        let refund_seq = next_event_sequence_id(&env)?;
         env.events().publish(
-            (symbol_short!("remrefnd"),),
+            (symbol_short!("remrefnd"), refund_seq),
             RemittanceRefundedEvent {
                 id: remittance_id,
                 sender,

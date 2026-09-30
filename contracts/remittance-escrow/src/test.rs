@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{token, Bytes, Env};
+use soroban_sdk::testutils::{Address as _, Events, Ledger};
+use soroban_sdk::{token, Bytes, Env, Symbol, TryIntoVal, Vec};
 
 const DAY: u64 = 86_400;
 
@@ -320,4 +320,103 @@ fn test_get_remittance_not_found() {
     let s = setup();
     let c = client(&s);
     c.get_remittance(&999);
+}
+
+// ── Event sequence ids ─────────────────────────────────────────────────────
+// Every published event carries a persistent, monotonically increasing
+// `event_sequence_id` as its second topic so indexers can order and
+// deduplicate events contract-wide.
+
+/// Collect the sequence id (second topic) of every event this contract has
+/// emitted so far (the SAC token and other participants emit events with
+/// different topics and must be excluded).
+fn all_event_sequence_ids(env: &Env) -> Vec<u64> {
+    let mut seqs = Vec::new(env);
+    for (_, topics, _) in env.events().all().iter() {
+        let topic0: Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
+        let is_contract_event = topic0 == symbol_short!("cinit")
+            || topic0 == symbol_short!("remcreat")
+            || topic0 == symbol_short!("paycomp")
+            || topic0 == symbol_short!("coldep")
+            || topic0 == symbol_short!("paydisp")
+            || topic0 == symbol_short!("remrefnd");
+        if is_contract_event {
+            let seq: u64 = topics.get(1).unwrap().try_into_val(env).unwrap();
+            seqs.push_back(seq);
+        }
+    }
+    seqs
+}
+
+#[test]
+fn test_event_sequence_ids_are_monotonic_and_unique() {
+    let s = setup();
+    let c = client(&s);
+
+    // initialize consumed sequence 0 ("cinit").
+    let id0 = c.create_remittance(&s.sender, &s.anchor, &10_000, &DAY);
+    let _id1 = c.create_remittance(&s.sender, &s.anchor, &5_000, &DAY);
+    let proof = Bytes::from_slice(&s.env, b"receipt-hash");
+    c.submit_payout_proof(&s.anchor, &id0, &proof);
+    c.deposit_collateral(&s.anchor, &2_000);
+
+    let seqs = all_event_sequence_ids(&s.env);
+
+    // Every emitted contract event got a sequence id (cinit + 4 actions).
+    assert_eq!(seqs.len() as u32, 5);
+    // Strictly increasing => monotonic and unique.
+    for i in 1..seqs.len() as u32 {
+        assert!(
+            seqs.get(i) > seqs.get(i - 1),
+            "sequence ids must be strictly increasing"
+        );
+    }
+    // First id starts at 0 and each event allocates exactly one id.
+    assert_eq!(seqs.get(0), Some(0));
+    assert_eq!(seqs.get(4), Some(4));
+}
+
+#[test]
+fn test_dispute_emits_two_distinct_sequence_ids() {
+    let s = setup();
+    let c = client(&s);
+    let tok = token_client(&s);
+
+    let id = c.create_remittance(&s.sender, &s.anchor, &10_000, &DAY);
+    c.deposit_collateral(&s.anchor, &10_000);
+    advance_time(&s.env, DAY + DAY);
+    let sender_balance_after_create = tok.balance(&s.sender);
+    c.open_dispute(&s.sender, &id);
+
+    // open_dispute publishes two events ("paydisp" + "remrefnd"), each with
+    // its own strictly increasing sequence id.
+    let contract_seqs = all_event_sequence_ids(&s.env);
+    // cinit, remcreat, coldep, paydisp, remrefnd (token transfers excluded).
+    assert_eq!(contract_seqs.len() as u32, 5);
+
+    let paydisp_seq: u64 = s.env
+        .events()
+        .all()
+        .iter()
+        .find(|(_, topics, _)| {
+            let t: Symbol = topics.get(0).unwrap().try_into_val(&s.env).unwrap();
+            t == symbol_short!("paydisp")
+        })
+        .map(|(_, topics, _)| topics.get(1).unwrap().try_into_val(&s.env).unwrap())
+        .unwrap();
+    let remrefnd_seq: u64 = s.env
+        .events()
+        .all()
+        .iter()
+        .find(|(_, topics, _)| {
+            let t: Symbol = topics.get(0).unwrap().try_into_val(&s.env).unwrap();
+            t == symbol_short!("remrefnd")
+        })
+        .map(|(_, topics, _)| topics.get(1).unwrap().try_into_val(&s.env).unwrap())
+        .unwrap();
+
+    assert_eq!(paydisp_seq + 1, remrefnd_seq);
+    // The refund actually paid out, proving the event ids came from the
+    // successful, ordered emission path.
+    assert_eq!(tok.balance(&s.sender), sender_balance_after_create + 10_000);
 }
