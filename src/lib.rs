@@ -3056,6 +3056,77 @@ impl TimeLockedUpgradeContract {
         zk::verifier::batch_verify_proofs(&env, &proofs)
     }
 
+    // ── Timelocked ZK Verification Key Rotation (Issue #931) ──────────────
+
+    /// Queue a governance-timelocked rotation of a circuit's ZK verification
+    /// key. The new verification key and its proving key are validated
+    /// structurally before the proposal is persisted. Returns the version
+    /// identifier assigned to the queued update.
+    pub fn queue_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        vkey: zk::verifier::VerificationKey,
+        proving_key: zk::proving_key::UploadedProvingKey,
+        schema: zk::proving_key::ProvingKeySchema,
+    ) -> Result<u32, ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        let update = zk::key_update::queue_verification_key_update(
+            &env,
+            caller,
+            vkey,
+            proving_key,
+            schema,
+        )?;
+        Ok(update.version)
+    }
+
+    /// Execute a queued ZK verification-key rotation once its governance
+    /// timelock has elapsed. Re-validates structural integrity, commits the
+    /// key, and emits `ZKVerificationKeysUpdated` with the version identifier.
+    pub fn execute_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        circuit_id: BytesN<32>,
+    ) -> Result<u32, ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        zk::key_update::execute_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Cancel a pending (queued but unexecuted) ZK verification-key rotation.
+    pub fn cancel_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        circuit_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        zk::key_update::cancel_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Read the pending ZK verification-key rotation for a circuit, if any.
+    pub fn get_pending_zk_verification_key_update(
+        env: Env,
+        circuit_id: BytesN<32>,
+    ) -> Option<zk::key_update::ZKVerificationKeyUpdate> {
+        zk::key_update::get_pending_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Read the latest committed ZK verification-key version for a circuit.
+    pub fn get_zk_verification_key_version(env: Env, circuit_id: BytesN<32>) -> u32 {
+        zk::key_update::get_verification_key_version(&env, &circuit_id)
+    }
+
 #[cfg(test)]
 mod query_guardrail_tests {
     use super::*;
