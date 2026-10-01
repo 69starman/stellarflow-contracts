@@ -69,6 +69,7 @@ pub mod amm;
 pub mod admin;
 pub mod auth;
 pub mod bridge;
+pub mod keeper;
 pub mod escrow;
 pub mod config;
 pub mod consensus;
