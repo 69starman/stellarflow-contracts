@@ -81,6 +81,7 @@ pub mod temp_governance;
 use crate::validation::check_bond_capacity;
 pub mod governance;
 pub mod math;
+pub mod oracle_attestation;
 pub mod orders;
 pub mod recovery;
 pub mod rescue;
@@ -217,32 +218,50 @@ pub enum ContractError {
     InvalidCircuitBreakerConfig = 67,
     /// Pool trading is currently frozen by the spot-price circuit breaker.
     CircuitBreakerTripped = 68,
+    /// Deadline for an operation has passed.
+    DeadlineReached = 69,
+    /// Deadline for an operation has not yet been reached.
+    DeadlineNotReached = 70,
+    /// Deadline is too soon (minimum offset not satisfied).
+    DeadlineTooSoon = 71,
+    /// Deadline is too far in the future (maximum offset exceeded).
+    DeadlineTooFar = 72,
+    /// Invalid argument provided to a function.
+    InvalidArgument = 73,
+    /// Invalid asset identifier.
+    InvalidAsset = 74,
+    /// Escrow is in an invalid state for the requested operation.
+    InvalidEscrowState = 75,
     /// Tick spacing must be a strictly positive integer.
-    InvalidTickSpacing = 69,
+    InvalidTickSpacing = 76,
     /// The tick index for this pool already exists.
-    TickIndexAlreadyExists = 70,
+    TickIndexAlreadyExists = 77,
     /// No tick index exists for this pool.
-    TickIndexNotFound = 71,
+    TickIndexNotFound = 78,
     /// Tick must be aligned to the pool's configured tick spacing.
-    TickNotAligned = 72,
+    TickNotAligned = 79,
     /// Tick index is outside the allowed price range bounds.
-    TickOutOfBounds = 73,
+    TickOutOfBounds = 80,
     /// Too many initialized ticks for a single pool.
-    TooManyTicks = 74,
+    TooManyTicks = 81,
     /// Protected asset (primary pool or vault reserve) cannot be rescued.
-    ProtectedAssetNotRescueable = 75,
+    ProtectedAssetNotRescueable = 82,
     /// Token rescue proposal was not found.
-    RescueProposalNotFound = 76,
+    RescueProposalNotFound = 83,
     /// Token rescue proposal is not pending.
-    RescueProposalNotPending = 77,
+    RescueProposalNotPending = 84,
     /// Mandatory timelock delay has not expired yet.
-    RescueTimelockNotExpired = 78,
+    RescueTimelockNotExpired = 85,
     /// Emergency override mechanism is disabled.
-    EmergencyOverrideDisabled = 79,
+    EmergencyOverrideDisabled = 86,
     /// Caller is not an authorized emergency signer.
-    NotEmergencySigner = 80,
+    NotEmergencySigner = 87,
     /// Emergency override vote threshold not yet reached.
     OverrideThresholdNotReached = 81,
+    /// Dynamic remittance fee split configuration is invalid.
+    InvalidFeeSplitConfig = 82,
+    /// A fee allocation does not add up to the original total.
+    FeeDistributionMismatch = 83,
 }
 
 impl ContractError {
@@ -2086,6 +2105,45 @@ impl TimeLockedUpgradeContract {
     ) -> soroban_sdk::Vec<orders::limit::LiquidityLevel> {
         orders::limit::get_liquidity_depth(&env, pair, is_bid)
     }
+    /// Calculate spread ratio for a trading pair: S = (P_ask_min - P_bid_max) / P_bid_max
+    pub fn calculate_spread_ratio(env: Env, pair: orders::limit::AssetPair) -> Result<i128, ContractError> {
+        let (best_bid_opt, best_ask_opt) = orders::limit::get_best_bid_ask(&env, &pair);
+        if best_bid_opt.is_none() || best_ask_opt.is_none() {
+            return Err(ContractError::InsufficientLiquidityDepth);
+        }
+        orders::limit::calculate_spread_ratio(best_bid_opt.unwrap(), best_ask_opt.unwrap())
+    }
+
+    /// Get best bid and best ask prices for a trading pair
+    pub fn get_best_bid_ask(env: Env, pair: orders::limit::AssetPair) -> (Option<i128>, Option<i128>) {
+        orders::limit::get_best_bid_ask(&env, &pair)
+    }
+
+    /// Check spread imbalance and trigger alert if spread > 5%
+    pub fn check_spread_imbalance(env: Env, pair: orders::limit::AssetPair) -> Result<orders::limit::SpreadImbalance, ContractError> {
+        orders::limit::check_spread_imbalance(&env, &pair)
+    }
+
+    /// Emit liquidity provider alert
+    pub fn emit_liquidity_provider_alert(
+        env: Env,
+        pair: orders::limit::AssetPair,
+        best_bid: i128,
+        best_ask: i128,
+        spread_ratio: i128,
+    ) -> Result<(), ContractError> {
+        orders::limit::emit_liquidity_provider_alert(&env, &pair, best_bid, best_ask, spread_ratio)
+    }
+
+    /// Check if liquidity is thin
+    pub fn is_liquidity_thin(env: Env, pair: orders::limit::AssetPair) -> bool {
+        orders::limit::is_liquidity_thin(&env, &pair)
+    }
+
+    /// Enforce fallback market maker pricing curves when liquidity is thin
+    pub fn enforce_fallback_pricing(env: Env, pair: orders::limit::AssetPair, base_price: i128) -> Result<i128, ContractError> {
+        orders::limit::enforce_fallback_pricing(&env, &pair, base_price)
+    }
 
     // ── Anti-frontrunning Commit-Reveal Order Scheme (Issue #761) ───────────
 
@@ -2655,12 +2713,42 @@ impl TimeLockedUpgradeContract {
         admin::prune::prune_expired_keys(&env, &admin, &targets)
     }
 
-    pub fn cleanup_inactive_accounts(
+    /// Bulk sweep rent deposits from helper contracts whose live state set has
+    /// already been exhausted. Returns the total bytes reclaimed.
+    pub fn sweep_inactive_helper_rent(
         env: Env,
-        caller: Address,
-        targets: Vec<Address>,
-    ) -> Result<u32, ContractError> {
-        Ok(admin::cleanup_accounts::cleanup_inactive_accounts(&env, &caller, &targets))
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::sweep_inactive_helper_contract_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn collect_expired_storage_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::collect_expired_storage_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn bulk_collect_storage_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::bulk_collect_storage_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn sweep_expired_contract_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::sweep_expired_contract_rent(&env, &admin, &treasury, &helpers)
     }
 
     // ── Dynamic Liquidity Pool Swap Fee Tier Controller ─────────────────────
@@ -2888,6 +2976,15 @@ impl TimeLockedUpgradeContract {
 
     // ── Groth16 ZK Proof Verification (Issue #725) ────────────────────────
 
+    /// Validate an uploaded Groth16 proving key against the BN254 schema.
+    pub fn validate_zk_proving_key(
+        _env: Env,
+        key: zk::proving_key::UploadedProvingKey,
+        schema: zk::proving_key::ProvingKeySchema,
+    ) -> Result<(), ContractError> {
+        zk::proving_key::validate_proving_key(&key, &schema)
+    }
+
     /// Register a Groth16 verification key for a circuit on-chain.
     pub fn register_zk_verification_key(
         env: Env,
@@ -2957,6 +3054,77 @@ impl TimeLockedUpgradeContract {
         )>,
     ) -> Result<Vec<zk::verifier::VerificationResult>, ContractError> {
         zk::verifier::batch_verify_proofs(&env, &proofs)
+    }
+
+    // ── Timelocked ZK Verification Key Rotation (Issue #931) ──────────────
+
+    /// Queue a governance-timelocked rotation of a circuit's ZK verification
+    /// key. The new verification key and its proving key are validated
+    /// structurally before the proposal is persisted. Returns the version
+    /// identifier assigned to the queued update.
+    pub fn queue_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        vkey: zk::verifier::VerificationKey,
+        proving_key: zk::proving_key::UploadedProvingKey,
+        schema: zk::proving_key::ProvingKeySchema,
+    ) -> Result<u32, ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        let update = zk::key_update::queue_verification_key_update(
+            &env,
+            caller,
+            vkey,
+            proving_key,
+            schema,
+        )?;
+        Ok(update.version)
+    }
+
+    /// Execute a queued ZK verification-key rotation once its governance
+    /// timelock has elapsed. Re-validates structural integrity, commits the
+    /// key, and emits `ZKVerificationKeysUpdated` with the version identifier.
+    pub fn execute_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        circuit_id: BytesN<32>,
+    ) -> Result<u32, ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        zk::key_update::execute_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Cancel a pending (queued but unexecuted) ZK verification-key rotation.
+    pub fn cancel_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        circuit_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        zk::key_update::cancel_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Read the pending ZK verification-key rotation for a circuit, if any.
+    pub fn get_pending_zk_verification_key_update(
+        env: Env,
+        circuit_id: BytesN<32>,
+    ) -> Option<zk::key_update::ZKVerificationKeyUpdate> {
+        zk::key_update::get_pending_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Read the latest committed ZK verification-key version for a circuit.
+    pub fn get_zk_verification_key_version(env: Env, circuit_id: BytesN<32>) -> u32 {
+        zk::key_update::get_verification_key_version(&env, &circuit_id)
     }
 
 #[cfg(test)]
