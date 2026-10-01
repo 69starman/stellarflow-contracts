@@ -69,6 +69,7 @@ pub mod amm;
 pub mod admin;
 pub mod auth;
 pub mod bridge;
+pub mod keeper;
 pub mod escrow;
 pub mod config;
 pub mod consensus;
@@ -84,6 +85,7 @@ pub mod math;
 pub mod oracle_attestation;
 pub mod orders;
 pub mod recovery;
+pub mod remittance;
 pub mod rescue;
 pub mod roles;
 pub mod router;
@@ -3080,23 +3082,75 @@ impl TimeLockedUpgradeContract {
         zk::verifier::batch_verify_proofs(&env, &proofs)
     }
 
-    /// Verify ZK proof public inputs guard for deposit notes against contract state (Issue #981).
-    pub fn verify_zk_deposit_public_inputs(
+    // ── Timelocked ZK Verification Key Rotation (Issue #931) ──────────────
+
+    /// Queue a governance-timelocked rotation of a circuit's ZK verification
+    /// key. The new verification key and its proving key are validated
+    /// structurally before the proposal is persisted. Returns the version
+    /// identifier assigned to the queued update.
+    pub fn queue_zk_verification_key_update(
         env: Env,
-        public_inputs: zk::public_input_guard::DepositNotePublicInputs,
-        submitted_params: zk::public_input_guard::SubmittedDepositParameters,
-    ) -> Result<(), ContractError> {
-        zk::public_input_guard::verify_deposit_public_inputs(&env, &public_inputs, &submitted_params)
+        caller: Address,
+        vkey: zk::verifier::VerificationKey,
+        proving_key: zk::proving_key::UploadedProvingKey,
+        schema: zk::proving_key::ProvingKeySchema,
+    ) -> Result<u32, ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        let update = zk::key_update::queue_verification_key_update(
+            &env,
+            caller,
+            vkey,
+            proving_key,
+            schema,
+        )?;
+        Ok(update.version)
     }
 
-    /// Compute dynamic swap fee fswap = fbase + (Vsigma * fscalar) constrained to fswap <= 0.01 (Issue #930).
-    pub fn compute_adaptive_swap_fee(
+    /// Execute a queued ZK verification-key rotation once its governance
+    /// timelock has elapsed. Re-validates structural integrity, commits the
+    /// key, and emits `ZKVerificationKeysUpdated` with the version identifier.
+    pub fn execute_zk_verification_key_update(
         env: Env,
-        f_base: u32,
-        v_sigma: u32,
-        f_scalar: u32,
+        caller: Address,
+        circuit_id: BytesN<32>,
     ) -> Result<u32, ContractError> {
-        amm::adaptive_fee::compute_oracle_volatility_fee(f_base, v_sigma, f_scalar)
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        zk::key_update::execute_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Cancel a pending (queued but unexecuted) ZK verification-key rotation.
+    pub fn cancel_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        circuit_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        zk::key_update::cancel_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Read the pending ZK verification-key rotation for a circuit, if any.
+    pub fn get_pending_zk_verification_key_update(
+        env: Env,
+        circuit_id: BytesN<32>,
+    ) -> Option<zk::key_update::ZKVerificationKeyUpdate> {
+        zk::key_update::get_pending_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Read the latest committed ZK verification-key version for a circuit.
+    pub fn get_zk_verification_key_version(env: Env, circuit_id: BytesN<32>) -> u32 {
+        zk::key_update::get_verification_key_version(&env, &circuit_id)
     }
 
 #[cfg(test)]
