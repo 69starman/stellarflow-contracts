@@ -264,6 +264,8 @@ pub enum ContractError {
     InvalidFeeSplitConfig = 82,
     /// A fee allocation does not add up to the original total.
     FeeDistributionMismatch = 83,
+    /// Public inputs to zero-knowledge proof do not match contract state parameters.
+    InvalidZKPublicInputs = 84,
 }
 
 impl ContractError {
@@ -2402,6 +2404,28 @@ impl TimeLockedUpgradeContract {
         pubkey: BytesN<32>,
     ) -> Result<(), ContractError> {
         bridge::relayer::remove_validator(&env, &admin, pubkey)
+    }
+
+    /// Stake collateral deposit for an active bridge validator (Issue #959).
+    pub fn stake_bridge_validator(
+        env: Env,
+        validator: BytesN<32>,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        bridge::slashing::stake_validator_collateral(&env, &validator, amount)
+    }
+
+    /// Get current staked collateral deposit for a bridge validator (Issue #959).
+    pub fn get_bridge_validator_collateral(env: Env, validator: BytesN<32>) -> i128 {
+        bridge::slashing::get_validator_collateral(&env, &validator)
+    }
+
+    /// Submit cryptographic double-sign proof to slash offending validator 100% and ban permanently (Issue #959).
+    pub fn submit_double_sign_proof(
+        env: Env,
+        proof: bridge::slashing::DoubleSignProof,
+    ) -> Result<i128, ContractError> {
+        bridge::slashing::process_double_sign_proof(&env, &proof)
     }
 
     // --- Native bridge escrow (Issue #750) ---
