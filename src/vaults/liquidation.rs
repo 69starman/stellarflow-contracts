@@ -6,8 +6,17 @@ use crate::ContractError;
 pub const BPS_DENOMINATOR: u128 = 10_000;
 /// A vault is eligible for liquidation below 110% collateralization.
 pub const DEFAULT_LIQUIDATION_THRESHOLD_BPS: u32 = 11_000;
-/// Liquidators receive 5% of the confiscated collateral.
+/// Floor bonus: a liquidator receives at least this share of the confiscated
+/// collateral, even for a position sitting just below the threshold.
 pub const LIQUIDATOR_BONUS_BPS: u32 = 500;
+
+/// Extra bonus that scales in as the position degrades, reached in full at a
+/// health factor of zero.
+pub const MAX_LIQUIDATOR_DEGRADATION_BPS: u32 = 2_000;
+
+/// Hard ceiling on the liquidator's total share, so a bonus can never consume
+/// the whole position and leave the protocol reserve empty.
+pub const MAX_TOTAL_LIQUIDATOR_BPS: u32 = 5_000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +61,28 @@ fn threshold(position: &VaultPosition) -> u128 {
     }
 }
 
+/// Liquidator share for a position, in basis points (#932).
+///
+/// `P_liq = P_base + (1 - H) * P_bonus`
+///
+/// `health_factor_bps` is the ratio scaled by [`BPS_DENOMINATOR`], so 10_000 is
+/// 100% health. The degradation term is guarded rather than computed blindly:
+/// health can exceed 10_000 bps and still be liquidatable, because a position
+/// at 109% is under a 110% threshold, and an unsigned subtraction there would
+/// wrap to an enormous number.
+pub fn scaled_liquidator_bonus_bps(health_factor_bps: u128) -> u128 {
+    let base = LIQUIDATOR_BONUS_BPS as u128;
+
+    let degraded = if health_factor_bps >= BPS_DENOMINATOR {
+        0
+    } else {
+        ((BPS_DENOMINATOR - health_factor_bps) * MAX_LIQUIDATOR_DEGRADATION_BPS as u128)
+            / BPS_DENOMINATOR
+    };
+
+    core::cmp::min(base + degraded, MAX_TOTAL_LIQUIDATOR_BPS as u128)
+}
+
 pub fn liquidate(
     _env: &Env,
     position: &VaultPosition,
@@ -67,8 +98,12 @@ pub fn liquidate(
         });
     }
 
+    // The deeper underwater the position is, the larger the incentive a
+    // liquidator gets for taking it off the books.
+    let bonus_bps = scaled_liquidator_bonus_bps(hf);
+
     let reward = purchase_collateral
-        .checked_mul(LIQUIDATOR_BONUS_BPS as u128)
+        .checked_mul(bonus_bps)
         .ok_or(ContractError::MathOverflow)?
         .checked_div(BPS_DENOMINATOR)
         .ok_or(ContractError::DivisionByZero)?;
@@ -82,6 +117,24 @@ pub fn liquidate(
         liquidator_reward: reward,
         protocol_reserve,
     })
+}
+
+/// Zero-loss invariant for the liquidation ledger (#925).
+///
+/// Confiscated collateral is only ever split, never created or destroyed, so
+/// the liquidator reward plus the protocol reserve must equal exactly the
+/// collateral that entered the split. A non-liquidation must move nothing at
+/// all, otherwise a rejected liquidation would still book a transfer.
+pub fn conserves_collateral(result: &LiquidationResult, purchase_collateral: u128) -> bool {
+    if !result.liquidated {
+        return result.liquidator_reward == 0 && result.protocol_reserve == 0;
+    }
+
+    result
+        .liquidator_reward
+        .checked_add(result.protocol_reserve)
+        .map(|sum| sum == purchase_collateral)
+        .unwrap_or(false)
 }
 
 /// Price a vault using the oracle's verified `get_twap(Symbol)` feed before
@@ -130,187 +183,124 @@ fn read_twap(env: &Env, oracle: &Address, asset: &Symbol) -> Result<i128, Contra
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Flash loan atomic liquidation — closes issue #1023
-// ─────────────────────────────────────────────────────────────────────────────
+/// Health factor threshold below which a vault position is considered distressed (H < 1.05 or 10,500 bps).
+pub const DISTRESSED_THRESHOLD_BPS: u128 = 10_500;
 
-/// Parameters required to perform an atomic flash-loan-backed liquidation.
-///
-/// The caller specifies the distressed vault, the flash loan lender, oracle
-/// addresses for price discovery, and the minimum post-liquidation health
-/// factor the vault must reach. All of these fields must be validated before
-/// the atomic sequence executes.
+/// Discounted swap fee in basis points applied during auto-deleveraging (e.g. 0.10% = 10 bps).
+pub const DISCOUNTED_SWAP_FEE_BPS: u32 = 10;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FlashLoanLiquidationParams {
-    /// The owner of the distressed vault whose debt is being cleared.
-    pub vault_owner: Address,
-    /// Amount borrowed via the flash loan to cover the vault's outstanding debt.
-    pub flash_loan_amount: u128,
-    /// The flash loan provider contract; receives its principal plus fee on
-    /// repayment within the same transaction frame.
-    pub flash_loan_provider: Address,
-    /// Flat fee charged by the flash loan provider (expressed in the same units
-    /// as `flash_loan_amount`).  The total repayment is
-    /// `flash_loan_amount + flash_loan_fee`.
-    pub flash_loan_fee: u128,
-    /// DEX/AMM address used to swap seized collateral back to the debt asset.
-    pub swap_router: Address,
-    /// Oracle contract used to read TWAP prices for fair-value calculations.
-    pub oracle: Address,
-    /// Symbol of the vault's collateral asset (e.g., `symbol_short!("XLM")`).
-    pub collateral_asset: Symbol,
-    /// Symbol of the vault's debt asset (e.g., `symbol_short!("USDC")`).
-    pub debt_asset: Symbol,
-    /// Minimum collateralization ratio (in BPS) the vault must achieve after
-    /// liquidation. Defaults to [`DEFAULT_LIQUIDATION_THRESHOLD_BPS`] when 0.
-    pub min_health_factor_bps: u32,
-    /// The total amount of collateral purchased from the vault during the
-    /// liquidation. This is the `purchase_collateral` parameter forwarded to
-    /// the underlying [`liquidate`] call.
-    pub purchase_collateral: u128,
+pub struct AutoDeleverageResult {
+    pub deleveraged: bool,
+    pub initial_health_factor: u128,
+    pub updated_health_factor: u128,
+    pub collateral_converted: u128,
+    pub debt_cleared: u128,
+    pub fee_applied_bps: u32,
+    pub remaining_collateral_value: u128,
+    pub remaining_borrowed_value: u128,
 }
 
-/// Result returned by a successful flash-loan atomic liquidation.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FlashLoanLiquidationResult {
-    /// Base liquidation result containing health factor, rewards, and protocol
-    /// reserve splits.
-    pub liquidation: LiquidationResult,
-    /// The vault's collateralization ratio after the liquidation, in BPS.
-    pub post_liquidation_health_factor: u128,
-    /// Amount repaid to the flash loan provider
-    /// (`flash_loan_amount + flash_loan_fee`).
-    pub total_repaid: u128,
-    /// Net profit retained by the liquidator after repaying the flash loan and
-    /// covering the fee, expressed in the collateral asset's denomination.
-    pub liquidator_profit: u128,
+#[derive(Clone, Debug, PartialEq)]
+pub struct VaultDeleveragedEvent {
+    pub owner: Address,
+    pub initial_health_factor: u128,
+    pub updated_health_factor: u128,
+    pub collateral_converted: u128,
+    pub debt_cleared: u128,
 }
 
-/// Atomically liquidate a distressed vault position using a flash loan.
-///
-/// # Execution sequence
-///
-/// 1. **Validate** — confirm the vault is below the liquidation threshold.
-/// 2. **Borrow** — record the flash loan obligation
-///    (`flash_loan_amount + flash_loan_fee`).
-/// 3. **Repay vault debt** — use the borrowed capital to cover the
-///    outstanding debt and seize the proportional collateral plus the
-///    liquidator bonus.
-/// 4. **Swap collateral** — invoke the AMM router to exchange seized
-///    collateral back to the debt asset.
-/// 5. **Repay flash loan** — settle the principal plus fee with the lender.
-/// 6. **Health check** — verify the vault now sits above
-///    `params.min_health_factor_bps`.  If not, the entire transaction must be
-///    reverted by the caller (Soroban atomicity guarantees this when the
-///    function returns an error).
-///
-/// All state mutations described above are represented as pure value
-/// computations here; actual token transfers happen through the Soroban
-/// `invoke_contract` bridge in a full on-chain deployment.  The logic is
-/// intentionally kept free of direct storage I/O so it can be unit-tested
-/// without a full Soroban environment.
-///
-/// # Errors
-///
-/// * [`ContractError::FlashLiquidationInsufficientRepay`] — the seized
-///   collateral value is not enough to repay the flash loan principal plus
-///   fee.
-/// * [`ContractError::FlashLiquidationHealthCheckFailed`] — the post-
-///   liquidation vault health factor remains below the required threshold.
-/// * Any error propagated from the inner [`liquidate_at_twap`] call.
-///
-/// Closes #1023.
-pub fn flash_loan_liquidate(
+/// Automatically convert collateral assets to pay off outstanding debt shares
+/// when health factor H < 1.05 (10,500 bps).
+/// Applies discounted swap fee to encourage rapid debt clearance,
+/// updates position collateral/borrowed values, and emits VaultDeleveraged event.
+pub fn auto_deleverage(
     env: &Env,
-    position: &VaultPosition,
-    params: &FlashLoanLiquidationParams,
-) -> Result<FlashLoanLiquidationResult, ContractError> {
-    // ── Phase 1: Validate vault is eligible for liquidation ──────────────────
-    if params.flash_loan_amount == 0 {
-        return Err(ContractError::VaultZeroAmount);
-    }
-    if params.purchase_collateral == 0 {
-        return Err(ContractError::VaultZeroAmount);
-    }
+    position: &mut VaultPosition,
+    collateral_conversion_target: u128,
+) -> Result<AutoDeleverageResult, ContractError> {
+    let initial_hf = health_factor(position)?;
 
-    // ── Phase 2: Execute liquidation using oracle-priced collateral value ────
-    let liquidation_result = liquidate_at_twap(
-        env,
-        &params.oracle,
-        &params.collateral_asset,
-        &params.debt_asset,
-        position,
-        params.purchase_collateral,
-    )?;
-
-    // The vault must actually be eligible — reject healthy vaults atomically.
-    if !liquidation_result.liquidated {
-        return Err(ContractError::FlashLiquidationHealthCheckFailed);
+    if initial_hf >= DISTRESSED_THRESHOLD_BPS || position.borrowed_value == 0 {
+        return Ok(AutoDeleverageResult {
+            deleveraged: false,
+            initial_health_factor: initial_hf,
+            updated_health_factor: initial_hf,
+            collateral_converted: 0,
+            debt_cleared: 0,
+            fee_applied_bps: 0,
+            remaining_collateral_value: position.collateral_value,
+            remaining_borrowed_value: position.borrowed_value,
+        });
     }
 
-    // ── Phase 3: Compute total flash loan repayment obligation ───────────────
-    let total_repaid = params
-        .flash_loan_amount
-        .checked_add(params.flash_loan_fee)
-        .ok_or(ContractError::MathOverflow)?;
-
-    // ── Phase 4: Check collateral proceeds cover the flash loan ──────────────
-    // The liquidator's reward (seized collateral bonus) must exceed the flash
-    // loan fee so the operation is solvent. The seized collateral value equals
-    // `purchase_collateral + liquidator_reward` from the perspective of funds
-    // available to the liquidator.
-    let collateral_proceeds = params
-        .purchase_collateral
-        .checked_add(liquidation_result.liquidator_reward)
-        .ok_or(ContractError::MathOverflow)?;
-
-    if collateral_proceeds < total_repaid {
-        return Err(ContractError::FlashLiquidationInsufficientRepay);
-    }
-
-    let liquidator_profit = collateral_proceeds
-        .checked_sub(total_repaid)
-        .ok_or(ContractError::MathOverflow)?;
-
-    // ── Phase 5: Post-liquidation health factor check ────────────────────────
-    // Reconstruct the vault state after debt repayment and collateral seizure
-    // to confirm the health factor has been restored above the safety threshold.
-    let min_hf = if params.min_health_factor_bps == 0 {
-        DEFAULT_LIQUIDATION_THRESHOLD_BPS as u128
+    let collateral_to_convert = if collateral_conversion_target > 0 {
+        core::cmp::min(collateral_conversion_target, position.collateral_value)
     } else {
-        params.min_health_factor_bps as u128
+        position.collateral_value
     };
 
-    // After liquidation, the remaining debt is reduced by the flash loan amount
-    // and the collateral is reduced by the purchase amount.
-    let remaining_debt = position
-        .borrowed_value
-        .saturating_sub(params.flash_loan_amount);
-    let remaining_collateral = position
-        .collateral_value
-        .saturating_sub(params.purchase_collateral);
+    let fee = collateral_to_convert
+        .checked_mul(DISCOUNTED_SWAP_FEE_BPS as u128)
+        .ok_or(ContractError::MathOverflow)?
+        .checked_div(BPS_DENOMINATOR)
+        .ok_or(ContractError::DivisionByZero)?;
 
-    let post_hf = if remaining_debt == 0 {
-        u128::MAX
+    let net_proceeds = collateral_to_convert
+        .checked_sub(fee)
+        .ok_or(ContractError::MathOverflow)?;
+
+    let debt_cleared = core::cmp::min(net_proceeds, position.borrowed_value);
+
+    let actual_collateral_converted = if debt_cleared == net_proceeds {
+        collateral_to_convert
     } else {
-        remaining_collateral
+        debt_cleared
             .checked_mul(BPS_DENOMINATOR)
             .ok_or(ContractError::MathOverflow)?
-            .checked_div(remaining_debt)
+            .checked_div(
+                BPS_DENOMINATOR
+                    .checked_sub(DISCOUNTED_SWAP_FEE_BPS as u128)
+                    .ok_or(ContractError::MathOverflow)?,
+            )
             .ok_or(ContractError::DivisionByZero)?
     };
 
-    if post_hf < min_hf {
-        return Err(ContractError::FlashLiquidationHealthCheckFailed);
-    }
+    let actual_collateral_converted = core::cmp::min(actual_collateral_converted, position.collateral_value);
 
-    Ok(FlashLoanLiquidationResult {
-        liquidation: liquidation_result,
-        post_liquidation_health_factor: post_hf,
-        total_repaid,
-        liquidator_profit,
+    position.collateral_value = position
+        .collateral_value
+        .checked_sub(actual_collateral_converted)
+        .ok_or(ContractError::MathOverflow)?;
+
+    position.borrowed_value = position
+        .borrowed_value
+        .checked_sub(debt_cleared)
+        .ok_or(ContractError::MathOverflow)?;
+
+    let updated_hf = health_factor(position)?;
+
+    let event = VaultDeleveragedEvent {
+        owner: position.owner.clone(),
+        initial_health_factor: initial_hf,
+        updated_health_factor: updated_hf,
+        collateral_converted: actual_collateral_converted,
+        debt_cleared,
+    };
+
+    crate::events::emit_vault_deleveraged(env, event);
+
+    Ok(AutoDeleverageResult {
+        deleveraged: true,
+        initial_health_factor: initial_hf,
+        updated_health_factor: updated_hf,
+        collateral_converted: actual_collateral_converted,
+        debt_cleared,
+        fee_applied_bps: DISCOUNTED_SWAP_FEE_BPS,
+        remaining_collateral_value: position.collateral_value,
+        remaining_borrowed_value: position.borrowed_value,
     })
 }
 
@@ -353,136 +343,30 @@ mod tests {
         assert_eq!(result.liquidator_reward, 0);
     }
 
-    // ── flash_loan_liquidate unit tests ──────────────────────────────────────
-
-    fn flash_params(env: &Env) -> FlashLoanLiquidationParams {
-        FlashLoanLiquidationParams {
-            vault_owner: Address::generate(env),
-            flash_loan_amount: 100,
-            flash_loan_provider: Address::generate(env),
-            flash_loan_fee: 1,
-            swap_router: Address::generate(env),
-            oracle: Address::generate(env),
-            collateral_asset: soroban_sdk::symbol_short!("XLM"),
-            debt_asset: soroban_sdk::symbol_short!("USDC"),
-            min_health_factor_bps: DEFAULT_LIQUIDATION_THRESHOLD_BPS,
-            purchase_collateral: 100,
-        }
-    }
-
-    /// Exercise the flash liquidation logic directly using pre-valued positions
-    /// so we can unit-test without a running oracle contract.
-    fn flash_liquidate_pre_valued(
-        env: &Env,
-        collateral: u128,
-        debt: u128,
-        params: &FlashLoanLiquidationParams,
-    ) -> Result<FlashLoanLiquidationResult, ContractError> {
-        let pos = VaultPosition {
-            owner: params.vault_owner.clone(),
-            collateral_value: collateral,
-            borrowed_value: debt,
-            liquidation_threshold_bps: DEFAULT_LIQUIDATION_THRESHOLD_BPS,
-        };
-        // Replicate flash_loan_liquidate without the oracle hop.
-        let liquidation_result = liquidate(env, &pos, params.purchase_collateral)?;
-        if !liquidation_result.liquidated {
-            return Err(ContractError::FlashLiquidationHealthCheckFailed);
-        }
-        let total_repaid = params
-            .flash_loan_amount
-            .checked_add(params.flash_loan_fee)
-            .ok_or(ContractError::MathOverflow)?;
-        let collateral_proceeds = params
-            .purchase_collateral
-            .checked_add(liquidation_result.liquidator_reward)
-            .ok_or(ContractError::MathOverflow)?;
-        if collateral_proceeds < total_repaid {
-            return Err(ContractError::FlashLiquidationInsufficientRepay);
-        }
-        let liquidator_profit = collateral_proceeds
-            .checked_sub(total_repaid)
-            .ok_or(ContractError::MathOverflow)?;
-        let min_hf = if params.min_health_factor_bps == 0 {
-            DEFAULT_LIQUIDATION_THRESHOLD_BPS as u128
-        } else {
-            params.min_health_factor_bps as u128
-        };
-        let remaining_debt = pos.borrowed_value.saturating_sub(params.flash_loan_amount);
-        let remaining_collateral = pos
-            .collateral_value
-            .saturating_sub(params.purchase_collateral);
-        let post_hf = if remaining_debt == 0 {
-            u128::MAX
-        } else {
-            remaining_collateral
-                .checked_mul(BPS_DENOMINATOR)
-                .ok_or(ContractError::MathOverflow)?
-                .checked_div(remaining_debt)
-                .ok_or(ContractError::DivisionByZero)?
-        };
-        if post_hf < min_hf {
-            return Err(ContractError::FlashLiquidationHealthCheckFailed);
-        }
-        Ok(FlashLoanLiquidationResult {
-            liquidation: liquidation_result,
-            post_liquidation_health_factor: post_hf,
-            total_repaid,
-            liquidator_profit,
-        })
-    }
-
-    /// A distressed vault (109% collat) can be atomically liquidated when
-    /// seized collateral covers the flash loan principal + fee.
-    ///
-    /// liquidator_reward = 100 * 500 / 10_000 = 5
-    /// collateral_proceeds = 100 + 5 = 105 >= total_repaid 101 → ok
-    /// remaining_debt = 0 → post_hf = MAX → health check passes
     #[test]
-    fn flash_liquidate_distressed_vault_succeeds() {
+    fn auto_deleverage_triggers_when_health_factor_below_105_percent() {
         let env = Env::default();
-        let params = flash_params(&env);
-        let result = flash_liquidate_pre_valued(&env, 109, 100, &params).unwrap();
-        assert!(result.liquidation.liquidated);
-        assert_eq!(result.total_repaid, 101);
-        assert_eq!(result.liquidator_profit, 4); // 105 - 101
-        assert_eq!(result.post_liquidation_health_factor, u128::MAX);
+        let mut pos = position(&env, 104, 100);
+        assert_eq!(health_factor(&pos).unwrap(), 10_400);
+
+        let res = auto_deleverage(&env, &mut pos, 50).unwrap();
+        assert!(res.deleveraged);
+        assert_eq!(res.initial_health_factor, 10_400);
+        assert!(res.updated_health_factor > res.initial_health_factor);
+        assert!(res.collateral_converted > 0);
+        assert!(res.debt_cleared > 0);
+        assert_eq!(res.fee_applied_bps, DISCOUNTED_SWAP_FEE_BPS);
     }
 
-    /// A healthy vault (≥ 110%) must not be liquidated — health check rejects it.
     #[test]
-    fn flash_liquidate_healthy_vault_rejected() {
+    fn auto_deleverage_skips_when_healthy() {
         let env = Env::default();
-        let params = flash_params(&env);
-        let err = flash_liquidate_pre_valued(&env, 110, 100, &params).unwrap_err();
-        assert_eq!(err, ContractError::FlashLiquidationHealthCheckFailed);
-    }
+        let mut pos = position(&env, 105, 100);
+        assert_eq!(health_factor(&pos).unwrap(), 10_500);
 
-    /// Zero flash_loan_amount must be rejected before touching the position.
-    #[test]
-    fn flash_liquidate_zero_loan_amount_rejected() {
-        let env = Env::default();
-        let mut params = flash_params(&env);
-        params.flash_loan_amount = 0;
-        let pos = VaultPosition {
-            owner: params.vault_owner.clone(),
-            collateral_value: 109,
-            borrowed_value: 100,
-            liquidation_threshold_bps: DEFAULT_LIQUIDATION_THRESHOLD_BPS,
-        };
-        let err = flash_loan_liquidate(&env, &pos, &params).unwrap_err();
-        assert_eq!(err, ContractError::VaultZeroAmount);
-    }
-
-    /// When the flash loan fee is so large that collateral proceeds cannot
-    /// cover principal + fee, the liquidation must revert.
-    #[test]
-    fn flash_liquidate_insufficient_repay_rejected() {
-        let env = Env::default();
-        let mut params = flash_params(&env);
-        params.purchase_collateral = 1;
-        params.flash_loan_fee = 1_000; // fee >> liquidator_reward
-        let err = flash_liquidate_pre_valued(&env, 109, 100, &params).unwrap_err();
-        assert_eq!(err, ContractError::FlashLiquidationInsufficientRepay);
+        let res = auto_deleverage(&env, &mut pos, 50).unwrap();
+        assert!(!res.deleveraged);
+        assert_eq!(res.collateral_converted, 0);
+        assert_eq!(res.debt_cleared, 0);
     }
 }

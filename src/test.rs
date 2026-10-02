@@ -1,5 +1,5 @@
 use soroban_sdk::{symbol_short, Bytes, Env};
-use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo}; // Removed Symbol as _
+use soroban_sdk::testutils::{Address as _, Events, Ledger, LedgerInfo}; // Removed Symbol as _
 use crate::{
     ContractError, StakingTier, StakingTierConfig, TimeLockedUpgradeContract,
     TimeLockedUpgradeContractClient, DEFAULT_HEARTBEAT_INTERVAL, 
@@ -184,6 +184,123 @@ fn test_propose_upgrade() {
     let remaining = client.get_upgrade_timelock_remaining();
     assert!(remaining.is_some());
     assert_eq!(remaining.unwrap(), 5000u32);
+}
+
+#[test]
+fn test_multi_stage_timelock_full_lifecycle() {
+    use crate::upgrades::multi_stage::{
+        TimelockStage, STAGE1_INTENT_DELAY_SECONDS, STAGE2_APPROVAL_DELAY_SECONDS,
+        STAGE3_EXECUTION_WINDOW_SECONDS,
+    };
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let treasury = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &treasury);
+
+    let new_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[9u8; 32]);
+
+    // Stage 1: announce intent.
+    client.notify_upgrade_intent(&new_wasm_hash, &admin);
+    let entry = client.get_multi_stage_upgrade().unwrap();
+    assert_eq!(entry.stage, TimelockStage::IntentNotified);
+    assert_eq!(
+        client.get_multi_stage_remaining().unwrap(),
+        STAGE1_INTENT_DELAY_SECONDS
+    );
+
+    // Stage 2 cannot be approved before the 24-hour delay elapses.
+    assert_eq!(
+        client.try_approve_upgrade_payload(&admin),
+        Err(Ok(ContractError::UpgradeTimelockNotSatisfied))
+    );
+
+    // Advance past the Stage 1 delay and approve the payload.
+    advance_ledger_timestamp(&env, STAGE1_INTENT_DELAY_SECONDS);
+    client.approve_upgrade_payload(&admin);
+    let entry = client.get_multi_stage_upgrade().unwrap();
+    assert_eq!(entry.stage, TimelockStage::PayloadApproved);
+    assert_eq!(
+        client.get_multi_stage_remaining().unwrap(),
+        STAGE2_APPROVAL_DELAY_SECONDS
+    );
+
+    // Stage 3 cannot execute before the 48-hour delay elapses.
+    assert_eq!(
+        client.try_execute_queued_upgrade(&admin),
+        Err(Ok(ContractError::UpgradeTimelockNotSatisfied))
+    );
+
+    // Advance into the execution window and execute.
+    advance_ledger_timestamp(&env, STAGE2_APPROVAL_DELAY_SECONDS);
+    client.execute_queued_upgrade(&admin);
+    let entry = client.get_multi_stage_upgrade().unwrap();
+    assert_eq!(entry.stage, TimelockStage::Executed);
+
+    // The window is 24 hours wide; executing again is rejected.
+    advance_ledger_timestamp(&env, STAGE3_EXECUTION_WINDOW_SECONDS + 1);
+    assert_eq!(
+        client.try_execute_queued_upgrade(&admin),
+        Err(Ok(ContractError::UpgradeTimelockNotSatisfied))
+    );
+}
+
+#[test]
+fn test_multi_stage_window_expires() {
+    use crate::upgrades::multi_stage::{
+        TimelockStage, STAGE1_INTENT_DELAY_SECONDS, STAGE2_APPROVAL_DELAY_SECONDS,
+        STAGE3_EXECUTION_WINDOW_SECONDS,
+    };
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let treasury = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &treasury);
+
+    let new_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[3u8; 32]);
+    client.notify_upgrade_intent(&new_wasm_hash, &admin);
+    advance_ledger_timestamp(&env, STAGE1_INTENT_DELAY_SECONDS);
+    client.approve_upgrade_payload(&admin);
+
+    // Let the 48-hour delay and the 24-hour window both pass.
+    advance_ledger_timestamp(
+        &env,
+        STAGE2_APPROVAL_DELAY_SECONDS + STAGE3_EXECUTION_WINDOW_SECONDS + 1,
+    );
+
+    assert_eq!(
+        client.try_execute_queued_upgrade(&admin),
+        Err(Ok(ContractError::UpgradeTimelockNotSatisfied))
+    );
+    let entry = client.get_multi_stage_upgrade().unwrap();
+    assert_eq!(entry.stage, TimelockStage::Expired);
+}
+
+#[test]
+fn test_multi_stage_requires_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let treasury = soroban_sdk::Address::generate(&env);
+    let stranger = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &treasury);
+
+    let new_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[5u8; 32]);
+    assert_eq!(
+        client.try_notify_upgrade_intent(&new_wasm_hash, &stranger),
+        Err(Ok(ContractError::NotAdmin))
+    );
 }
 
 #[test]
@@ -1265,6 +1382,9 @@ fn test_replacement_signer_promoted_on_revocation() {
     // is recognised as a valid participant.
     let result = client.try_vote_emergency_revocation(&replacement, &u64::MAX);
     assert_eq!(result, Err(Ok(ContractError::NoActiveEmergencyRevocation)));
+
+    let event_debug = alloc::format!("{:?}", env.events().all());
+    assert!(event_debug.contains("SignerRevokedEmergency"));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
