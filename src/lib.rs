@@ -69,6 +69,7 @@ pub mod amm;
 pub mod admin;
 pub mod auth;
 pub mod bridge;
+pub mod keeper;
 pub mod escrow;
 pub mod config;
 pub mod consensus;
@@ -81,8 +82,10 @@ pub mod temp_governance;
 use crate::validation::check_bond_capacity;
 pub mod governance;
 pub mod math;
+pub mod oracle_attestation;
 pub mod orders;
 pub mod recovery;
+pub mod remittance;
 pub mod rescue;
 pub mod roles;
 pub mod router;
@@ -217,32 +220,52 @@ pub enum ContractError {
     InvalidCircuitBreakerConfig = 67,
     /// Pool trading is currently frozen by the spot-price circuit breaker.
     CircuitBreakerTripped = 68,
+    /// Deadline for an operation has passed.
+    DeadlineReached = 69,
+    /// Deadline for an operation has not yet been reached.
+    DeadlineNotReached = 70,
+    /// Deadline is too soon (minimum offset not satisfied).
+    DeadlineTooSoon = 71,
+    /// Deadline is too far in the future (maximum offset exceeded).
+    DeadlineTooFar = 72,
+    /// Invalid argument provided to a function.
+    InvalidArgument = 73,
+    /// Invalid asset identifier.
+    InvalidAsset = 74,
+    /// Escrow is in an invalid state for the requested operation.
+    InvalidEscrowState = 75,
     /// Tick spacing must be a strictly positive integer.
-    InvalidTickSpacing = 69,
+    InvalidTickSpacing = 76,
     /// The tick index for this pool already exists.
-    TickIndexAlreadyExists = 70,
+    TickIndexAlreadyExists = 77,
     /// No tick index exists for this pool.
-    TickIndexNotFound = 71,
+    TickIndexNotFound = 78,
     /// Tick must be aligned to the pool's configured tick spacing.
-    TickNotAligned = 72,
+    TickNotAligned = 79,
     /// Tick index is outside the allowed price range bounds.
-    TickOutOfBounds = 73,
+    TickOutOfBounds = 80,
     /// Too many initialized ticks for a single pool.
-    TooManyTicks = 74,
+    TooManyTicks = 81,
     /// Protected asset (primary pool or vault reserve) cannot be rescued.
-    ProtectedAssetNotRescueable = 75,
+    ProtectedAssetNotRescueable = 82,
     /// Token rescue proposal was not found.
-    RescueProposalNotFound = 76,
+    RescueProposalNotFound = 83,
     /// Token rescue proposal is not pending.
-    RescueProposalNotPending = 77,
+    RescueProposalNotPending = 84,
     /// Mandatory timelock delay has not expired yet.
-    RescueTimelockNotExpired = 78,
+    RescueTimelockNotExpired = 85,
     /// Emergency override mechanism is disabled.
-    EmergencyOverrideDisabled = 79,
+    EmergencyOverrideDisabled = 86,
     /// Caller is not an authorized emergency signer.
-    NotEmergencySigner = 80,
+    NotEmergencySigner = 87,
     /// Emergency override vote threshold not yet reached.
     OverrideThresholdNotReached = 81,
+    /// Dynamic remittance fee split configuration is invalid.
+    InvalidFeeSplitConfig = 82,
+    /// A fee allocation does not add up to the original total.
+    FeeDistributionMismatch = 83,
+    /// Public inputs to zero-knowledge proof do not match contract state parameters.
+    InvalidZKPublicInputs = 84,
 }
 
 impl ContractError {
@@ -256,6 +279,26 @@ impl ContractError {
     pub const BridgeSupplyCapExceeded: Self = Self::Overflow;
     pub const BridgeInsufficientBalance: Self = Self::Overflow;
     pub const BridgeEscrowNotConfigured: Self = Self::NotInitialized;
+
+    // ── Bridge wrapped supply cap guard (Issue #1009) ─────────────────────
+    // Semantic aliases only, matching the `Bridge*` and `Harvest*` conventions
+    // above. No new `#[contracterror]` variants: that enum is already at 82
+    // cases against the soroban-sdk 20 cap of 50, so each new error is an alias
+    // rather than another variant.
+    /// A mint would push wrapped supply past the collateral-backed cap.
+    pub const BridgeCapExceeded: Self = Self::InsufficientReserveBalance;
+    /// Verified locked collateral is insufficient to cover the active wrapped
+    /// supply, or is smaller than a requested release.
+    pub const BridgeCapUndercollateralized: Self = Self::InsufficientReserveBalance;
+    /// A release or reconciliation asked for more than is recorded.
+    pub const BridgeCapInsufficientCollateral: Self = Self::InsufficientReserveBalance;
+    /// A locked-collateral figure was negative, which is not an observation.
+    pub const BridgeCapInvalidCollateral: Self = Self::InvalidArgument;
+    /// A configured capacity ratio fell outside its permitted bounds.
+    pub const BridgeCapInvalidConfig: Self = Self::InvalidVarianceConfig;
+    /// A supply delta, release amount or observed total was not strictly
+    /// positive, or reconciliation tried to lower the mirrored supply.
+    pub const BridgeCapInvalidAmount: Self = Self::AmountTooLow;
     pub const AdminChangeTimelockNotSatis: Self = Self::UpgradeTimelockNotSatisfied;
     pub const StagingNotAuthorized: Self = Self::Unauthorized;
     pub const EmptyRoute: Self = Self::AmountTooLow;
@@ -287,6 +330,28 @@ impl ContractError {
     pub const HarvestSwapFailed: Self = Self::RouteExecutionFailed;
     pub const HarvestSlippageExceeded: Self = Self::SlippageExceeded;
     pub const HarvestInvalidPath: Self = Self::InconsistentRouteAssets;
+
+    // ── Auto-compounding yield drawdown guard (Issue #1010) ────────────────
+    // Semantic aliases only, matching the `Harvest*` convention above. No new
+    // `#[contracterror]` variants are introduced: that enum is already at 82
+    // cases against the soroban-sdk 20 cap of 50, so every new error here is
+    // expressed as an alias rather than widening the enum.
+    /// Auto-compounding harvest is paused because the reward token breached
+    /// its drawdown limit.
+    pub const YieldCompoundingPaused: Self = Self::ContractPaused;
+    /// A price observation or a 7-day reference price was not strictly
+    /// positive, so the price trend is undefined.
+    pub const YieldPriceNotPositive: Self = Self::InvalidArgument;
+    /// A price observation preceded the newest retained sample, which would
+    /// allow the reference price to be rewound.
+    pub const YieldStalePriceSample: Self = Self::StaleSequence;
+    /// A configured drawdown limit fell outside its permitted bounds.
+    pub const YieldInvalidDrawdownLimit: Self = Self::InvalidVarianceConfig;
+    /// A reserve-conversion route did not run reward token to base reserve, or
+    /// its length was out of bounds.
+    pub const YieldInvalidConversionPath: Self = Self::InconsistentRouteAssets;
+    /// The router delivered no base reserve at all.
+    pub const YieldConversionProducedNothing: Self = Self::AmountTooLow;
 
     // ── Issue #720 canonical API error aliases ────────────────────────────────
     // These four names are the stable external-facing identifiers documented in
@@ -1057,6 +1122,137 @@ impl TimeLockedUpgradeContract {
         provider: Address,
     ) -> Option<settlement::fees::LiquidityPosition> {
         settlement::fees::get_position(&env, asset, provider)
+    }
+
+    // ── Cross-Border Fiat-Anchor Collateral Ratio Monitor (Issue #991) ──
+    //
+    // Tracks R_anchor = Collateral_locked / Volume_unsettled per
+    // (anchor, corridor) and pauses new remittance assignments to an anchor
+    // whose ratio drops below the corridor minimum (default 120 %). Routing
+    // resumes as soon as the anchor deposits enough additional collateral.
+
+    /// Post additional token collateral for a fiat anchor on a corridor.
+    ///
+    /// Doubles as the recovery path from a pause: once the backing ratio
+    /// reaches the corridor minimum the pause is cleared in the same call.
+    pub fn deposit_anchor_collateral(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralState, ContractError> {
+        settlement::anchor_collateral::deposit_collateral(&env, &caller, &anchor, corridor, amount)
+    }
+
+    /// Release uncommitted collateral back to an anchor.
+    ///
+    /// Rejected when the withdrawal would drop the backing ratio below the
+    /// corridor minimum, which includes every withdrawal while the anchor is
+    /// paused.
+    pub fn withdraw_anchor_collateral(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralState, ContractError> {
+        settlement::anchor_collateral::withdraw_collateral(&env, &caller, &anchor, corridor, amount)
+    }
+
+    /// Assign a new fiat payout to an anchor, appending it to the active
+    /// payout queue.
+    ///
+    /// Fails with [`ContractError::AnchorAssignmentsPaused`] when routing to
+    /// the anchor is already paused, and with
+    /// [`ContractError::AnchorUndercollateralized`] when admitting the payout
+    /// would push the backing ratio below the corridor minimum. The queue is
+    /// left untouched on either rejection path.
+    pub fn assign_anchor_fiat_payout(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::FiatPayoutEntry, ContractError> {
+        settlement::anchor_collateral::assign_fiat_payout(&env, &caller, &anchor, corridor, amount)
+    }
+
+    /// Mark a queued fiat payout as settled off-ledger, consuming the token
+    /// collateral that backed it.
+    pub fn settle_anchor_fiat_payout(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        payout_id: u64,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralState, ContractError> {
+        settlement::anchor_collateral::settle_fiat_payout(
+            &env, &caller, &anchor, corridor, payout_id, amount,
+        )
+    }
+
+    /// Permissionless monitoring tick: re-evaluate an anchor's backing ratio
+    /// and latch or clear its pause flag.
+    pub fn sync_anchor_collateral_ratio(
+        env: Env,
+        anchor: Address,
+        corridor: AssetId,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralStatus, ContractError> {
+        settlement::anchor_collateral::sync_anchor_ratio(&env, &anchor, corridor)
+    }
+
+    /// Read the monitoring snapshot for an anchor on a corridor.
+    pub fn get_anchor_collateral_status(
+        env: Env,
+        anchor: Address,
+        corridor: AssetId,
+    ) -> settlement::anchor_collateral::AnchorCollateralStatus {
+        settlement::anchor_collateral::get_anchor_status(&env, &anchor, corridor)
+    }
+
+    /// Read the active, unsettled fiat payout queue for an anchor.
+    pub fn get_anchor_payout_queue(
+        env: Env,
+        anchor: Address,
+        corridor: AssetId,
+    ) -> Vec<settlement::anchor_collateral::FiatPayoutEntry> {
+        settlement::anchor_collateral::read_payout_queue(&env, &anchor, corridor)
+    }
+
+    /// Governance-configurable minimum backing ratio for a corridor, in basis
+    /// points. Defaults to 120 % and cannot be set below 100 %.
+    pub fn set_anchor_min_collateral_ratio(
+        env: Env,
+        admin: Address,
+        corridor: AssetId,
+        min_ratio_bps: u32,
+    ) -> Result<u32, ContractError> {
+        settlement::anchor_collateral::set_min_collateral_ratio_bps(
+            &env, &admin, corridor, min_ratio_bps,
+        )
+    }
+
+    /// Compute the anchor backing ratio `Collateral_locked / Volume_unsettled`
+    /// in basis points. Saturates at [`u32::MAX`] and returns `0` for an
+    /// empty payout queue, where the ratio is unbounded.
+    pub fn anchor_backing_ratio_bps(collateral_locked: u128, volume_unsettled: u128) -> u32 {
+        settlement::anchor_collateral::backing_ratio_bps(collateral_locked, volume_unsettled)
+    }
+
+    /// `true` when `collateral_locked` backs `volume_unsettled` at
+    /// `min_ratio_bps`. An empty payout queue is always sufficient.
+    pub fn is_anchor_collateral_sufficient(
+        collateral_locked: u128,
+        volume_unsettled: u128,
+        min_ratio_bps: u32,
+    ) -> bool {
+        settlement::anchor_collateral::is_collateral_sufficient(
+            collateral_locked,
+            volume_unsettled,
+            min_ratio_bps,
+        )
     }
 
     /// Record flash loan fee revenue for an asset.
@@ -1961,6 +2157,141 @@ impl TimeLockedUpgradeContract {
         vaults::harvest_compound::harvest_and_compound(&env, user, router, path, min_lp_out)
     }
 
+    // ── Auto-compounding yield drawdown guard (Issue #1010) ─────────────────
+    //
+    // Tracks ΔP = (P_current - P_7d) / P_7d for each vault's target reward
+    // token and pauses auto-compounding harvest past the corridor drawdown
+    // limit (default 20 %), directing the strategy to convert accrued rewards
+    // into the base stablecoin reserve instead of re-investing them.
+
+    /// Configure a vault's drawdown guard.
+    pub fn configure_compounding_guard(
+        env: Env,
+        admin: Address,
+        vault: AssetId,
+        reward_token: Address,
+        base_reserve: Address,
+        max_drawdown_bps: i64,
+        window_secs: u64,
+    ) -> Result<vaults::compounding_guard::CompoundingGuardConfig, ContractError> {
+        vaults::compounding_guard::configure_guard(
+            &env,
+            &admin,
+            vault,
+            reward_token,
+            base_reserve,
+            max_drawdown_bps,
+            window_secs,
+        )
+    }
+
+    /// Update only the drawdown limit of an existing guard.
+    pub fn set_yield_max_drawdown_bps(
+        env: Env,
+        admin: Address,
+        vault: AssetId,
+        max_drawdown_bps: i64,
+    ) -> Result<vaults::compounding_guard::CompoundingGuardConfig, ContractError> {
+        vaults::compounding_guard::set_max_drawdown_bps(&env, &admin, vault, max_drawdown_bps)
+    }
+
+    /// Record a reward-token price observation and re-evaluate the guard.
+    pub fn record_yield_price_sample(
+        env: Env,
+        keeper: Address,
+        vault: AssetId,
+        price: i128,
+    ) -> Result<vaults::compounding_guard::DrawdownStatus, ContractError> {
+        vaults::compounding_guard::record_price_sample(&env, &keeper, vault, price)
+    }
+
+    /// Permissionless monitoring tick: re-evaluate the trend and latch or clear
+    /// the auto-compounding pause.
+    pub fn sync_yield_drawdown(
+        env: Env,
+        vault: AssetId,
+    ) -> Result<vaults::compounding_guard::DrawdownStatus, ContractError> {
+        vaults::compounding_guard::sync_drawdown(&env, vault)
+    }
+
+    /// Read the drawdown monitoring snapshot for a vault.
+    pub fn get_yield_drawdown_status(
+        env: Env,
+        vault: AssetId,
+    ) -> Result<vaults::compounding_guard::DrawdownStatus, ContractError> {
+        vaults::compounding_guard::drawdown_status(&env, vault)
+    }
+
+    /// `true` when auto-compounding harvest is paused for a vault.
+    pub fn is_yield_compounding_paused(env: Env, vault: AssetId) -> bool {
+        vaults::compounding_guard::is_auto_compounding_paused(&env, vault)
+    }
+
+    /// What the auto-compounding strategy should do with accrued rewards:
+    /// re-invest, convert to base reserves, or hold.
+    pub fn yield_compounding_action(
+        env: Env,
+        vault: AssetId,
+    ) -> vaults::compounding_guard::CompoundingAction {
+        vaults::compounding_guard::strategy_action(&env, vault)
+    }
+
+    /// Convert accrued rewards into the base stablecoin reserve instead of
+    /// re-investing them. Callable while the guard is tripped, which is exactly
+    /// when it is needed.
+    pub fn convert_yield_to_reserves(
+        env: Env,
+        keeper: Address,
+        router: Address,
+        vault: AssetId,
+        path: Vec<Address>,
+        reward_amount: i128,
+        min_reserve_out: i128,
+    ) -> Result<vaults::compounding_guard::ReserveConversion, ContractError> {
+        let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
+        vaults::compounding_guard::convert_rewards_to_reserves(
+            &env,
+            &keeper,
+            router,
+            vault,
+            path,
+            reward_amount,
+            min_reserve_out,
+        )
+    }
+
+    /// Read the base-reserve balance booked through conversions.
+    pub fn yield_reserve_accrued(env: Env, vault: AssetId) -> i128 {
+        vaults::compounding_guard::reserve_accrued(&env, vault)
+    }
+
+    /// Sweep booked base reserves out of the vault.
+    pub fn sweep_yield_reserves(
+        env: Env,
+        admin: Address,
+        to: Address,
+        vault: AssetId,
+        amount: i128,
+    ) -> Result<i128, ContractError> {
+        vaults::compounding_guard::sweep_reserves(&env, &admin, to, vault, amount)
+    }
+
+    /// Compute the signed price trend `(P_current - P_7d) / P_7d` in basis
+    /// points. Positive means appreciation.
+    pub fn yield_price_trend_bps(current: i128, reference: i128) -> Result<i64, ContractError> {
+        vaults::compounding_guard::price_trend_bps(current, reference)
+    }
+
+    /// `true` when the reward token has depreciated by strictly more than
+    /// `max_drawdown_bps` between `reference` and `current`.
+    pub fn is_yield_drawdown_exceeded(
+        current: i128,
+        reference: i128,
+        max_drawdown_bps: i64,
+    ) -> bool {
+        vaults::compounding_guard::is_drawdown_exceeded(current, reference, max_drawdown_bps)
+    }
+
     // ── On-chain limit order book (Issue #701) ───────────────────────────────
 
     pub fn place_limit_order(
@@ -2085,6 +2416,45 @@ impl TimeLockedUpgradeContract {
         env: Env, pair: orders::limit::AssetPair, is_bid: bool,
     ) -> soroban_sdk::Vec<orders::limit::LiquidityLevel> {
         orders::limit::get_liquidity_depth(&env, pair, is_bid)
+    }
+    /// Calculate spread ratio for a trading pair: S = (P_ask_min - P_bid_max) / P_bid_max
+    pub fn calculate_spread_ratio(env: Env, pair: orders::limit::AssetPair) -> Result<i128, ContractError> {
+        let (best_bid_opt, best_ask_opt) = orders::limit::get_best_bid_ask(&env, &pair);
+        if best_bid_opt.is_none() || best_ask_opt.is_none() {
+            return Err(ContractError::InsufficientLiquidityDepth);
+        }
+        orders::limit::calculate_spread_ratio(best_bid_opt.unwrap(), best_ask_opt.unwrap())
+    }
+
+    /// Get best bid and best ask prices for a trading pair
+    pub fn get_best_bid_ask(env: Env, pair: orders::limit::AssetPair) -> (Option<i128>, Option<i128>) {
+        orders::limit::get_best_bid_ask(&env, &pair)
+    }
+
+    /// Check spread imbalance and trigger alert if spread > 5%
+    pub fn check_spread_imbalance(env: Env, pair: orders::limit::AssetPair) -> Result<orders::limit::SpreadImbalance, ContractError> {
+        orders::limit::check_spread_imbalance(&env, &pair)
+    }
+
+    /// Emit liquidity provider alert
+    pub fn emit_liquidity_provider_alert(
+        env: Env,
+        pair: orders::limit::AssetPair,
+        best_bid: i128,
+        best_ask: i128,
+        spread_ratio: i128,
+    ) -> Result<(), ContractError> {
+        orders::limit::emit_liquidity_provider_alert(&env, &pair, best_bid, best_ask, spread_ratio)
+    }
+
+    /// Check if liquidity is thin
+    pub fn is_liquidity_thin(env: Env, pair: orders::limit::AssetPair) -> bool {
+        orders::limit::is_liquidity_thin(&env, &pair)
+    }
+
+    /// Enforce fallback market maker pricing curves when liquidity is thin
+    pub fn enforce_fallback_pricing(env: Env, pair: orders::limit::AssetPair, base_price: i128) -> Result<i128, ContractError> {
+        orders::limit::enforce_fallback_pricing(&env, &pair, base_price)
     }
 
     // ── Anti-frontrunning Commit-Reveal Order Scheme (Issue #761) ───────────
@@ -2342,6 +2712,28 @@ impl TimeLockedUpgradeContract {
         pubkey: BytesN<32>,
     ) -> Result<(), ContractError> {
         bridge::relayer::remove_validator(&env, &admin, pubkey)
+    }
+
+    /// Stake collateral deposit for an active bridge validator (Issue #959).
+    pub fn stake_bridge_validator(
+        env: Env,
+        validator: BytesN<32>,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        bridge::slashing::stake_validator_collateral(&env, &validator, amount)
+    }
+
+    /// Get current staked collateral deposit for a bridge validator (Issue #959).
+    pub fn get_bridge_validator_collateral(env: Env, validator: BytesN<32>) -> i128 {
+        bridge::slashing::get_validator_collateral(&env, &validator)
+    }
+
+    /// Submit cryptographic double-sign proof to slash offending validator 100% and ban permanently (Issue #959).
+    pub fn submit_double_sign_proof(
+        env: Env,
+        proof: bridge::slashing::DoubleSignProof,
+    ) -> Result<i128, ContractError> {
+        bridge::slashing::process_double_sign_proof(&env, &proof)
     }
 
     // --- Native bridge escrow (Issue #750) ---
@@ -2655,6 +3047,44 @@ impl TimeLockedUpgradeContract {
         admin::prune::prune_expired_keys(&env, &admin, &targets)
     }
 
+    /// Bulk sweep rent deposits from helper contracts whose live state set has
+    /// already been exhausted. Returns the total bytes reclaimed.
+    pub fn sweep_inactive_helper_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::sweep_inactive_helper_contract_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn collect_expired_storage_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::collect_expired_storage_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn bulk_collect_storage_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::bulk_collect_storage_rent(&env, &admin, &treasury, &helpers)
+    }
+
+    pub fn sweep_expired_contract_rent(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        helpers: Vec<Address>,
+    ) -> Result<u64, ContractError> {
+        admin::prune::sweep_expired_contract_rent(&env, &admin, &treasury, &helpers)
+    }
+
     // ── Dynamic Liquidity Pool Swap Fee Tier Controller ─────────────────────
 
     /// Initialize the fee tier controller with bounded safety ranges.
@@ -2880,6 +3310,15 @@ impl TimeLockedUpgradeContract {
 
     // ── Groth16 ZK Proof Verification (Issue #725) ────────────────────────
 
+    /// Validate an uploaded Groth16 proving key against the BN254 schema.
+    pub fn validate_zk_proving_key(
+        _env: Env,
+        key: zk::proving_key::UploadedProvingKey,
+        schema: zk::proving_key::ProvingKeySchema,
+    ) -> Result<(), ContractError> {
+        zk::proving_key::validate_proving_key(&key, &schema)
+    }
+
     /// Register a Groth16 verification key for a circuit on-chain.
     pub fn register_zk_verification_key(
         env: Env,
@@ -2949,6 +3388,77 @@ impl TimeLockedUpgradeContract {
         )>,
     ) -> Result<Vec<zk::verifier::VerificationResult>, ContractError> {
         zk::verifier::batch_verify_proofs(&env, &proofs)
+    }
+
+    // ── Timelocked ZK Verification Key Rotation (Issue #931) ──────────────
+
+    /// Queue a governance-timelocked rotation of a circuit's ZK verification
+    /// key. The new verification key and its proving key are validated
+    /// structurally before the proposal is persisted. Returns the version
+    /// identifier assigned to the queued update.
+    pub fn queue_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        vkey: zk::verifier::VerificationKey,
+        proving_key: zk::proving_key::UploadedProvingKey,
+        schema: zk::proving_key::ProvingKeySchema,
+    ) -> Result<u32, ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        let update = zk::key_update::queue_verification_key_update(
+            &env,
+            caller,
+            vkey,
+            proving_key,
+            schema,
+        )?;
+        Ok(update.version)
+    }
+
+    /// Execute a queued ZK verification-key rotation once its governance
+    /// timelock has elapsed. Re-validates structural integrity, commits the
+    /// key, and emits `ZKVerificationKeysUpdated` with the version identifier.
+    pub fn execute_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        circuit_id: BytesN<32>,
+    ) -> Result<u32, ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        zk::key_update::execute_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Cancel a pending (queued but unexecuted) ZK verification-key rotation.
+    pub fn cancel_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        circuit_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        zk::key_update::cancel_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Read the pending ZK verification-key rotation for a circuit, if any.
+    pub fn get_pending_zk_verification_key_update(
+        env: Env,
+        circuit_id: BytesN<32>,
+    ) -> Option<zk::key_update::ZKVerificationKeyUpdate> {
+        zk::key_update::get_pending_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Read the latest committed ZK verification-key version for a circuit.
+    pub fn get_zk_verification_key_version(env: Env, circuit_id: BytesN<32>) -> u32 {
+        zk::key_update::get_verification_key_version(&env, &circuit_id)
     }
 
 #[cfg(test)]

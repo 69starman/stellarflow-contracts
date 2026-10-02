@@ -95,6 +95,9 @@ pub const EV_HTLC_REFUND: Symbol = symbol_short!("htlc_ref");
 /// Router: a multi-hop route executed successfully.
 pub const EV_ROUTE_OK: Symbol = symbol_short!("route_ok");
 
+/// Liquidity provider alert triggered when spread imbalance exceeds threshold.
+pub const EV_LIQUIDITY_PROVIDER_ALERT: Symbol = symbol_short!("lp_alert");
+
 /// Admin: a coordinator was added.
 pub const EV_COORD_ADDED: Symbol = symbol_short!("coord_add");
 
@@ -146,6 +149,15 @@ pub const EV_BALLOT_CLOSED: Symbol = symbol_short!("ball_clos");
 /// Remittance: fees were routed through the fee splitter.
 pub const EV_REMITTANCE_FEES_ROUTED: Symbol = symbol_short!("rem_fee_r");
 
+/// Remittance: dynamic fee share for anchor vs yield-staker allocation was calculated.
+pub const EV_REMITTANCE_FEE_SPLIT_CALCULATED: Symbol = symbol_short!("rem_split");
+
+/// Protocol: adaptive fee was clamped to the hardcoded safety floor.
+pub const EV_PROTOCOL_FEE_FLOOR_ENFORCED: Symbol = symbol_short!("fee_floor");
+
+/// Treasury: reserve concentration exceeded the diversification threshold and a swap plan was generated.
+pub const EV_TREASURY_DIVERSIFICATION_TRIGGERED: Symbol = symbol_short!("treas_div");
+
 /// Governance: a proposal was vetoed by the Security Council.
 pub const EV_PROPOSAL_VETOED: Symbol = symbol_short!("prop_vet");
 
@@ -157,6 +169,12 @@ pub const EV_COMMIT_REVEAL: Symbol = symbol_short!("cmt_rev");
 
 /// Orders: a commitment's bond was forfeited after its reveal deadline passed.
 pub const EV_COMMIT_FORFEIT: Symbol = symbol_short!("cmt_frf");
+
+/// ZK: a batch of deposit note commitments was inserted into the Merkle tree.
+pub const EV_ZK_BATCH_COMMIT: Symbol = symbol_short!("zk_batch");
+
+/// Vault: position nearing insolvent threshold was automatically deleveraged.
+pub const EV_VAULT_DELEVERAGED: Symbol = symbol_short!("vlt_delev");
 
 // ---------------------------------------------------------------------------
 // Cross-border fiat escrow settlement lifecycle
@@ -418,6 +436,19 @@ pub fn emit_proposal_created(
     )
 }
 
+/// Emit a VaultDeleveraged event when a distressed vault is auto-deleveraged.
+pub fn emit_vault_deleveraged(
+    env: &Env,
+    event: crate::vaults::liquidation::VaultDeleveragedEvent,
+) {
+    let _ = emit_simple2(
+        env,
+        EV_VAULT_DELEVERAGED,
+        symbol_short!("deleverag"),
+        event,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -572,6 +603,8 @@ mod tests {
             EV_BALLOT_CLOSED,
             EV_REMITTANCE_FEES_ROUTED,
             EV_PROPOSAL_VETOED,
+            EV_ZK_BATCH_COMMIT,
+            EV_VAULT_DELEVERAGED,
         ];
         for name in names.iter() {
             assert!(

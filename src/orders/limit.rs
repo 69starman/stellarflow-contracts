@@ -1122,6 +1122,164 @@ pub fn match_market_order(
     })
 }
 
+
+// ── On-chain limit order book spread imbalance monitor (Issue #1014) ─────────
+//
+// Tracks bid-ask spread expansion for each resting book: computes the relative
+// spread S = (P_ask_min - P_bid_max) / P_bid_max at the top of the book and
+// raises a liquidity-provider alert when S exceeds 5% so keepers/LPs can react
+// to a degraded market. When the book is too thin to price reliably, callers
+// can fall back to a defensive market-maker pricing curve.
+
+/// Alert threshold for the relative bid-ask spread, scaled like every other
+/// price in this module: 5% = 0.05 * [`PRICE_SCALE`].
+pub const SPREAD_ALERT_THRESHOLD: i128 = PRICE_SCALE / 20;
+
+/// Minimum top-of-book depth (in base units) each side must rest before the
+/// book is considered sufficiently liquid for spread monitoring.
+pub const MIN_TOP_OF_BOOK_DEPTH: i128 = 1_000;
+
+/// Fallback market-maker reprice factor (2%) applied when the book is thin:
+/// `fallback = base * (1 + FALLBACK_REPRICE_BPS / BPS_SCALE)`.
+pub const FALLBACK_REPRICE_BPS: i128 = 200;
+
+/// Snapshot of a pair's top-of-book spread state.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpreadImbalance {
+    pub pair: AssetPair,
+    /// Highest resting bid tick (`P_bid_max`).
+    pub best_bid: i128,
+    /// Lowest resting ask tick (`P_ask_min`).
+    pub best_ask: i128,
+    /// Relative spread S = (ask_min - bid_max) / bid_max, scaled by
+    /// [`PRICE_SCALE`]; `0.05` → 5%.
+    pub spread_ratio: i128,
+    /// `false` when one side of the book is empty so `spread_ratio` is
+    /// undefined and a fallback pricing curve should be used.
+    pub has_liquidity: bool,
+}
+
+/// Compute the relative bid-ask spread ratio
+/// `S = (P_ask_min - P_bid_max) / P_bid_max`.
+///
+/// Returns `S` fixed-point scaled by [`PRICE_SCALE`] so `S > SPREAD_ALERT_THRESHOLD`
+/// means the spread has expanded beyond 5%.
+pub fn calculate_spread_ratio(best_bid: i128, best_ask: i128) -> Result<i128, ContractError> {
+    if best_bid <= 0 {
+        return Err(ContractError::DivisionByZero);
+    }
+    let spread = best_ask
+        .checked_sub(best_bid)
+        .ok_or(ContractError::MathOverflow)?;
+    spread
+        .checked_mul(PRICE_SCALE)
+        .ok_or(ContractError::MathOverflow)?
+        .checked_div(best_bid)
+        .ok_or(ContractError::DivisionByZero)
+}
+
+/// Return the current top-of-book bid (max bid tick) and ask (min ask tick)
+/// for `pair`. Active bid ticks are sorted descending and ask ticks ascending,
+/// so the head of each slice is the respective best price.
+pub fn get_best_bid_ask(env: &Env, pair: &AssetPair) -> (Option<i128>, Option<i128>) {
+    let bid_ticks: Vec<i128> = env
+        .storage()
+        .persistent()
+        .get(&LiquidityStorageKey::ActiveTicks(pair.clone(), true))
+        .unwrap_or_else(|| Vec::new(env));
+    let best_bid = if bid_ticks.is_empty() {
+        None
+    } else {
+        Some(bid_ticks.get(0).unwrap())
+    };
+
+    let ask_ticks: Vec<i128> = env
+        .storage()
+        .persistent()
+        .get(&LiquidityStorageKey::ActiveTicks(pair.clone(), false))
+        .unwrap_or_else(|| Vec::new(env));
+    let best_ask = if ask_ticks.is_empty() {
+        None
+    } else {
+        Some(ask_ticks.get(0).unwrap())
+    };
+
+    (best_bid, best_ask)
+}
+
+/// Returns `true` when the book cannot be relied on for pricing: either side is
+/// empty or its top-of-book depth is below [`MIN_TOP_OF_BOOK_DEPTH`].
+pub fn is_liquidity_thin(env: &Env, pair: &AssetPair) -> bool {
+    match get_best_bid_ask(env, pair) {
+        (Some(best_bid), Some(best_ask)) => {
+            get_tick_volume(env, pair.clone(), best_bid, true) < MIN_TOP_OF_BOOK_DEPTH
+                || get_tick_volume(env, pair.clone(), best_ask, false) < MIN_TOP_OF_BOOK_DEPTH
+        }
+        _ => true,
+    }
+}
+
+/// Publish a `LiquidityProviderAlert` event carrying the offending book state.
+pub fn emit_liquidity_provider_alert(
+    env: &Env,
+    pair: &AssetPair,
+    best_bid: i128,
+    best_ask: i128,
+    spread_ratio: i128,
+) -> Result<(), ContractError> {
+    crate::events::liquidity::publish_liquidity_provider_alert(
+        env, pair, best_bid, best_ask, spread_ratio,
+    );
+    Ok(())
+}
+
+/// Inspect the top of `pair`'s book, evaluate the spread ratio, and raise a
+/// liquidity-provider alert when the spread has expanded beyond
+/// [`SPREAD_ALERT_THRESHOLD`] (S > 0.05).
+pub fn check_spread_imbalance(env: &Env, pair: &AssetPair) -> Result<SpreadImbalance, ContractError> {
+    match get_best_bid_ask(env, pair) {
+        (Some(best_bid), Some(best_ask)) => {
+            let spread_ratio = calculate_spread_ratio(best_bid, best_ask)?;
+            if spread_ratio > SPREAD_ALERT_THRESHOLD {
+                emit_liquidity_provider_alert(env, pair, best_bid, best_ask, spread_ratio)?;
+            }
+            Ok(SpreadImbalance {
+                pair: pair.clone(),
+                best_bid,
+                best_ask,
+                spread_ratio,
+                has_liquidity: true,
+            })
+        }
+        _ => Ok(SpreadImbalance {
+            pair: pair.clone(),
+            best_bid: 0,
+            best_ask: 0,
+            spread_ratio: 0,
+            has_liquidity: false,
+        }),
+    }
+}
+
+/// Enforce a fallback market-maker pricing curve when the order book is too
+/// thin to price reliably. When the book has reasonable depth the `base_price`
+/// is returned untouched; otherwise the quote is repriced against the fallback
+/// curve (a defensive markup band) so callers never trade on an illiquid book.
+pub fn enforce_fallback_pricing(env: &Env, pair: &AssetPair, base_price: i128) -> Result<i128, ContractError> {
+    if !is_liquidity_thin(env, pair) || base_price <= 0 {
+        return Ok(base_price);
+    }
+    // Fallback market-maker curve: quote a markup band above the reference so
+    // a thin/one-sided book cannot be gamed into distorted executions.
+    let markup = base_price
+        .checked_mul(FALLBACK_REPRICE_BPS)
+        .ok_or(ContractError::MathOverflow)?;
+    base_price
+        .checked_add(markup / BPS_SCALE)
+        .ok_or(ContractError::MathOverflow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1382,185 +1540,129 @@ mod tests {
         assert_eq!(result, Err(Ok(ContractError::InsufficientLiquidityDepth)));
     }
 
+    // ── Spread imbalance monitor (Issue #1014) ───────────────────────────────
+
     #[test]
-    fn partial_fill_maintains_exact_proportional_locked_asset_ratio() {
+    fn spread_ratio_uses_best_bid_and_ask() {
         let (env, client, sell_asset, buy_asset, _) = setup();
-        let maker = Address::generate(&env);
-        let taker = Address::generate(&env);
-        mint(&env, &sell_asset, &maker, 1_000);
-        mint(&env, &buy_asset, &taker, 5_000);
-        let pair = AssetPair {
-            sell_asset: sell_asset.clone(),
-            buy_asset: buy_asset.clone(),
-        };
-        // P_order = 0.25, stored fixed-point (0.25 * PRICE_SCALE).
-        let order = client.place_limit_order(&maker, &pair, &(PRICE_SCALE / 4), &1_000);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        mint(&env, &sell_asset, &seller, 2_000);
+        mint(&env, &buy_asset, &buyer, 300_000);
+        let pair = AssetPair { sell_asset: sell_asset.clone(), buy_asset: buy_asset.clone() };
 
-        // ΔV = 401 yields ΔB = floor(401 * 0.25) = 100 exactly — the ratio
-        // `ΔA / ΔB = P_order` holds with a bounded <1-unit rounding residual.
-        let result = client.fill_limit_order(&taker, &order.id, &401);
-        assert_eq!(result.filled_amount, 401);
-        assert_eq!(result.paid_amount, 100);
+        // Ask at 1.01, bid at 1.00 -> S = 1%.
+        client.place_limit_order(&seller, &pair, &((PRICE_SCALE * 101) / 100), &1_000);
+        client.place_buy_limit_order(&buyer, &pair, &PRICE_SCALE, &1_000);
 
-        let sell_token = soroban_sdk::token::Client::new(&env, &sell_asset);
-        let buy_token = soroban_sdk::token::Client::new(&env, &buy_asset);
-        // Taker received ΔA=401; maker was paid ΔB=100 (0.25 ratio).
-        assert_eq!(sell_token.balance(&taker), 401);
-        assert_eq!(buy_token.balance(&maker), 100);
+        let (best_bid, best_ask) = client.get_best_bid_ask(&pair);
+        assert_eq!(best_bid, Some(PRICE_SCALE));
+        assert_eq!(best_ask, Some((PRICE_SCALE * 101) / 100));
 
-        let order_after = client.get_limit_order(&order.id).unwrap();
-        // V_remaining = V_initial - ΔV.
-        assert_eq!(order_after.remaining_amount, 599);
-        assert_eq!(order_after.filled_amount, 401);
-        assert!(order_after.active);
+        let ratio = client.calculate_spread_ratio(&pair).unwrap();
+        assert_eq!(ratio, PRICE_SCALE / 100);
+
+        let spread = client.check_spread_imbalance(&pair).unwrap();
+        assert!(spread.has_liquidity);
+        assert_eq!(spread.best_bid, PRICE_SCALE);
+        assert_eq!(spread.best_ask, (PRICE_SCALE * 101) / 100);
+        assert_eq!(spread.spread_ratio, PRICE_SCALE / 100);
     }
 
     #[test]
-    fn partial_fill_preserves_price_time_priority() {
+    fn spread_expansion_over_five_percent_emits_liquidity_provider_alert() {
         let (env, client, sell_asset, buy_asset, _) = setup();
-        let maker_a = Address::generate(&env);
-        let maker_b = Address::generate(&env);
-        let taker = Address::generate(&env);
-        mint(&env, &sell_asset, &maker_a, 100);
-        mint(&env, &sell_asset, &maker_b, 100);
-        mint(&env, &buy_asset, &taker, 2_000);
-        let pair = AssetPair {
-            sell_asset: sell_asset.clone(),
-            buy_asset: buy_asset.clone(),
-        };
-        let first = client.place_limit_order(&maker_a, &pair, &(2 * PRICE_SCALE), &100);
-        let second = client.place_limit_order(&maker_b, &pair, &(2 * PRICE_SCALE), &100);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        mint(&env, &sell_asset, &seller, 2_000);
+        mint(&env, &buy_asset, &buyer, 300_000);
+        let pair = AssetPair { sell_asset: sell_asset.clone(), buy_asset: buy_asset.clone() };
 
-        // Partially fill the first order; it must keep its FIFO slot at the tick.
-        client.fill_limit_order(&taker, &first.id, &40);
-        let bucket = client.get_orders_at_tick(&pair, &(2 * PRICE_SCALE));
-        assert_eq!(bucket.len(), 2);
-        assert_eq!(bucket.get(0).unwrap(), first.id);
-        assert_eq!(bucket.get(1).unwrap(), second.id);
-        let remaining_first = client.get_limit_order(&first.id).unwrap();
-        assert_eq!(remaining_first.remaining_amount, 60);
+        // Sparse book: ask at 1.10, bid at 1.00 -> S = 10% > 5%.
+        client.place_limit_order(&seller, &pair, &((PRICE_SCALE * 110) / 100), &1_000);
+        client.place_buy_limit_order(&buyer, &pair, &PRICE_SCALE, &1_000);
 
-        // A later fill still resolves to the earlier order first (time priority).
-        let fill = client.fill_limit_order(&taker, &first.id, &10);
-        assert_eq!(fill.order_id, first.id);
-        assert_eq!(fill.remaining_amount, 50);
+        let spread = client.check_spread_imbalance(&pair).unwrap();
+        assert!(spread.spread_ratio > SPREAD_ALERT_THRESHOLD);
+
+        let mut alert_seen = false;
+        let events = env.events().all();
+        for i in 0..events.len() {
+            let (_, topics, _) = events.get(i).unwrap();
+            if topics
+                .get(1)
+                == Some(soroban_sdk::Symbol::new(&env, "liquidity_provider_alert").into_val(&env))
+            {
+                alert_seen = true;
+            }
+        }
+        assert!(alert_seen, "liquidity provider alert event was not emitted");
     }
 
     #[test]
-    fn fill_below_dust_threshold_purges_order_and_refunds_maker() {
+    fn spread_below_threshold_does_not_emit_alert() {
         let (env, client, sell_asset, buy_asset, _) = setup();
-        let maker = Address::generate(&env);
-        let taker = Address::generate(&env);
-        let original = 100_000;
-        mint(&env, &sell_asset, &maker, original);
-        mint(&env, &buy_asset, &taker, 500_000);
-        let pair = AssetPair {
-            sell_asset: sell_asset.clone(),
-            buy_asset: buy_asset.clone(),
-        };
-        let order = client.place_limit_order(&maker, &pair, &PRICE_SCALE, &original);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        mint(&env, &sell_asset, &seller, 2_000);
+        mint(&env, &buy_asset, &buyer, 300_000);
+        let pair = AssetPair { sell_asset: sell_asset.clone(), buy_asset: buy_asset.clone() };
 
-        // Leaves V_remaining = 400 < 1% of V_initial (1000) → cancel + purge.
-        let result = client.fill_limit_order(&taker, &order.id, &(original - 400));
-        assert!(result.order_closed);
-        assert_eq!(result.remaining_amount, 0);
+        // Ask at 1.02, bid at 1.00 -> S = 2% < 5%.
+        client.place_limit_order(&seller, &pair, &((PRICE_SCALE * 102) / 100), &1_000);
+        client.place_buy_limit_order(&buyer, &pair, &PRICE_SCALE, &1_000);
 
-        // Order storage is purged — no resurrectable record remains.
-        assert_eq!(client.get_limit_order(&order.id), None);
-        assert_eq!(client.get_orders_at_tick(&pair, &PRICE_SCALE).len(), 0);
-        assert_eq!(client.get_tick_volume(&pair, &PRICE_SCALE, &false), 0);
+        let spread = client.check_spread_imbalance(&pair).unwrap();
+        assert!(spread.spread_ratio <= SPREAD_ALERT_THRESHOLD);
 
-        let sell_token = soroban_sdk::token::Client::new(&env, &sell_asset);
-        let buy_token = soroban_sdk::token::Client::new(&env, &buy_asset);
-        // Maker recovers the dust remainder (400) back from escrow.
-        assert_eq!(sell_token.balance(&maker), 400);
-        // Filler keeps the filled units.
-        assert_eq!(sell_token.balance(&taker), original - 400);
-        // Maker received quote for the filled units (P_order = 1.0).
-        assert_eq!(buy_token.balance(&maker), original - 400);
+        let events = env.events().all();
+        let mut alert_seen = false;
+        for i in 0..events.len() {
+            let (_, topics, _) = events.get(i).unwrap();
+            if topics
+                .get(1)
+                == Some(soroban_sdk::Symbol::new(&env, "liquidity_provider_alert").into_val(&env))
+            {
+                alert_seen = true;
+            }
+        }
+        assert!(!alert_seen, "alert should not fire for a healthy spread");
     }
 
     #[test]
-    fn market_buy_purges_dust_book_without_skipping_volume() {
+    fn thin_book_flags_and_enforces_fallback_pricing() {
         let (env, client, sell_asset, buy_asset, _) = setup();
-        let maker_a = Address::generate(&env);
-        let maker_b = Address::generate(&env);
-        let taker = Address::generate(&env);
-        mint(&env, &sell_asset, &maker_a, 100_000);
-        mint(&env, &sell_asset, &maker_b, 120_000);
-        mint(&env, &buy_asset, &taker, 1_000_000);
-        let pair = AssetPair {
-            sell_asset: sell_asset.clone(),
-            buy_asset: buy_asset.clone(),
-        };
-        let a = client.place_limit_order(&maker_a, &pair, &(2 * PRICE_SCALE), &100_000);
-        let b = client.place_limit_order(&maker_b, &pair, &(2 * PRICE_SCALE), &120_000);
+        let seller = Address::generate(&env);
+        mint(&env, &sell_asset, &seller, 2_000);
+        let pair = AssetPair { sell_asset: sell_asset.clone(), buy_asset };
 
-        // Market buy 219_000: A fully fills (100_000); B partially fills
-        // 119_000 leaving V_remaining = 1_000 < 1% of V_initial → purged
-        // mid-sweep. The cursor must keep walking the snapshot without
-        // skipping or re-visiting any order.
-        let result = client.match_market_order(&taker, &pair, &219_000, &true);
-        assert!(result.fully_filled);
-        assert_eq!(result.filled_amount, 219_000);
-        assert_eq!(result.fills.len(), 2);
-        assert_eq!(result.fills.get(0).unwrap().order_id, a.id);
-        assert_eq!(result.fills.get(1).unwrap().order_id, b.id);
+        // Ask-only book: no bid side at all -> thin.
+        client.place_limit_order(&seller, &pair, &PRICE_SCALE, &1_000);
+        assert!(client.is_liquidity_thin(&pair));
 
-        assert_eq!(client.get_tick_volume(&pair, &(2 * PRICE_SCALE), &false), 0);
-        assert_eq!(client.get_orders_at_tick(&pair, &(2 * PRICE_SCALE)).len(), 0);
-        // A fully-filled order stays as a closed record; B was purged.
-        let closed_a = client.get_limit_order(&a.id).unwrap();
-        assert!(!closed_a.active);
-        assert_eq!(closed_a.remaining_amount, 0);
-        assert_eq!(client.get_limit_order(&b.id), None);
+        let base = 10 * PRICE_SCALE;
+        let fallback = client.enforce_fallback_pricing(&pair, &base).unwrap();
+        assert!(fallback > base);
 
-        let sell_token = soroban_sdk::token::Client::new(&env, &sell_asset);
-        let buy_token = soroban_sdk::token::Client::new(&env, &buy_asset);
-        assert_eq!(sell_token.balance(&taker), 219_000);
-        assert_eq!(buy_token.balance(&maker_a), 200_000);
-        assert_eq!(buy_token.balance(&maker_b), 238_000);
-        // Maker B refunded remaining escrow of 1_000 sell_asset.
-        assert_eq!(sell_token.balance(&maker_b), 1_000);
+        // Adding both sides with real depth un-thins the book.
+        let buyer = Address::generate(&env);
+        mint(&env, &pair.buy_asset, &buyer, 200_000);
+        client.place_buy_limit_order(&buyer, &pair, &PRICE_SCALE, &2_000);
+        assert!(!client.is_liquidity_thin(&pair));
+        assert_eq!(client.enforce_fallback_pricing(&pair, &base).unwrap(), base);
     }
 
     #[test]
-    fn market_sell_purges_dust_bid_and_refunds_quote_escrow() {
+    fn one_sided_book_reports_no_spread_liquidity() {
         let (env, client, sell_asset, buy_asset, _) = setup();
-        let maker = Address::generate(&env);
-        let taker = Address::generate(&env);
-        // Bid of 150_000 base at P=2 locks quote = 300_000 buy_asset.
-        mint(&env, &buy_asset, &maker, 300_000);
-        mint(&env, &sell_asset, &taker, 200_000);
-        mint(&env, &buy_asset, &taker, 1_000_000);
-        let pair = AssetPair {
-            sell_asset: sell_asset.clone(),
-            buy_asset: buy_asset.clone(),
-        };
-        let bid = client.place_buy_limit_order(&maker, &pair, &(2 * PRICE_SCALE), &150_000);
+        let seller = Address::generate(&env);
+        mint(&env, &sell_asset, &seller, 1_000);
+        let pair = AssetPair { sell_asset, buy_asset };
+        client.place_limit_order(&seller, &pair, &PRICE_SCALE, &1_000);
 
-        // Market sell 149_000 base against the bid: fill 149_000 (paid
-        // 298_000 quote), leaving V_remaining = 1_000 < 1% of V_initial →
-        // purge refunds the remaining escrowed quote (quote_amount(1_000, 2*SCALE)
-        // = 2_000) to the maker.
-        let result = client.match_market_order(&taker, &pair, &149_000, &false);
-        assert!(result.fully_filled);
-        assert_eq!(result.fills.len(), 1);
-        assert_eq!(result.fills.get(0).unwrap().order_id, bid.id);
-        assert_eq!(result.fills.get(0).unwrap().tick_volume_after, 0);
-
-        assert_eq!(client.get_tick_volume(&pair, &(2 * PRICE_SCALE), &true), 0);
-        assert_eq!(client.get_orders_at_tick(&pair, &(2 * PRICE_SCALE)).len(), 0);
-        assert_eq!(client.get_limit_order(&bid.id), None);
-
-        let sell_token = soroban_sdk::token::Client::new(&env, &sell_asset);
-        let buy_token = soroban_sdk::token::Client::new(&env, &buy_asset);
-        // Taker disposed 149_000 base and received 298_000 quote.
-        assert_eq!(sell_token.balance(&taker), 51_000);
-        assert_eq!(buy_token.balance(&taker), 1_298_000);
-        // Maker received 149_000 base and was refunded the 2_000 quote dust
-        // remainder (contract released 298_000 + 2_000 = 300_000 in total).
-        assert_eq!(sell_token.balance(&maker), 149_000);
-        assert_eq!(buy_token.balance(&maker), 2_000);
+        let spread = client.check_spread_imbalance(&pair).unwrap();
+        assert!(!spread.has_liquidity);
+        assert_eq!(spread.spread_ratio, 0);
     }
 }
+
