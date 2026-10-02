@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{token, Bytes, Env};
+use soroban_sdk::testutils::{Address as _, Events, Ledger};
+use soroban_sdk::{token, Bytes, Env, Symbol, TryIntoVal, Vec};
 
 const DAY: u64 = 86_400;
 

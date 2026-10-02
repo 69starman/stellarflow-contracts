@@ -300,8 +300,9 @@ impl RemittanceEscrow {
             .set(&DataKey::NextRemittanceId, &0u64);
         env.storage().instance().set(&DataKey::Initialized, &true);
 
+        let seq = next_event_sequence_id(&env)?;
         env.events().publish(
-            (symbol_short!("cinit"),),
+            (symbol_short!("cinit"), seq),
             ContractInitializedEvent { admin, token },
         );
 
@@ -410,7 +411,7 @@ impl RemittanceEscrow {
         }
 
         env.events().publish(
-            (symbol_short!("remcreat"),),
+            (symbol_short!("remcreat"), seq),
             RemittanceCreatedEvent {
                 id,
                 sender,
@@ -453,7 +454,7 @@ impl RemittanceEscrow {
         decrement_pending_and_unlock(&env, &remittance.anchor);
 
         env.events().publish(
-            (symbol_short!("paycomp"),),
+            (symbol_short!("paycomp"), seq),
             PayoutCompletedEvent {
                 id: remittance_id,
                 anchor,
@@ -481,8 +482,9 @@ impl RemittanceEscrow {
         let total = checked_add(current, amount)?;
         set_collateral_balance(&env, &anchor, total);
 
+        let seq = next_event_sequence_id(&env)?;
         env.events().publish(
-            (symbol_short!("coldep"),),
+            (symbol_short!("coldep"), seq),
             CollateralDepositedEvent {
                 anchor,
                 amount,
@@ -581,8 +583,9 @@ impl RemittanceEscrow {
         remittance.status = RemittanceStatus::Refunded;
         set_remittance(&env, &remittance);
 
+        let dispute_seq = next_event_sequence_id(&env)?;
         env.events().publish(
-            (symbol_short!("paydisp"),),
+            (symbol_short!("paydisp"), dispute_seq),
             PayoutDisputedEvent {
                 id: remittance_id,
                 sender: sender.clone(),
@@ -590,8 +593,9 @@ impl RemittanceEscrow {
                 locked_collateral: locked,
             },
         );
+        let refund_seq = next_event_sequence_id(&env)?;
         env.events().publish(
-            (symbol_short!("remrefnd"),),
+            (symbol_short!("remrefnd"), refund_seq),
             RemittanceRefundedEvent {
                 id: remittance_id,
                 sender,
