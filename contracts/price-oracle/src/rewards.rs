@@ -64,8 +64,14 @@ impl Rewards {
 
         // INTERACTION: perform token transfer from contract -> relayer
         // We use the standard token client so any token-compatible contract can be used.
+        // Acquire reentrancy lock before cross-contract call
+        crate::reentrancy::acquire_lock(&env);
+        
         let token = soroban_sdk::token::Client::new(&env, &token_contract);
         token.transfer(&env.current_contract_address(), &relayer, &balance);
+        
+        // Release reentrancy lock after cross-contract call
+        crate::reentrancy::release_lock(&env);
 
         // Emit event for observability
         env.events().publish((Symbol::new(&env, "RewardClaimed"),), RewardClaimedEvent {
