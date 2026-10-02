@@ -19,6 +19,7 @@ members = [
     "contracts/reward-splitter",
     "contracts/shielded-remittance-escrow",
     "contracts/gas-tank",
+    "contracts/governance_executer",
     "contracts/vault-health-monitor",
     "contracts/multisig-weight-guard",
     "contracts/yield-unwind",
