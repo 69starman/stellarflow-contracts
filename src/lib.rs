@@ -69,6 +69,7 @@ pub mod amm;
 pub mod admin;
 pub mod auth;
 pub mod bridge;
+pub mod keeper;
 pub mod escrow;
 pub mod config;
 pub mod consensus;
@@ -84,6 +85,7 @@ pub mod math;
 pub mod oracle_attestation;
 pub mod orders;
 pub mod recovery;
+pub mod remittance;
 pub mod rescue;
 pub mod roles;
 pub mod router;
@@ -262,6 +264,8 @@ pub enum ContractError {
     InvalidFeeSplitConfig = 82,
     /// A fee allocation does not add up to the original total.
     FeeDistributionMismatch = 83,
+    /// Public inputs to zero-knowledge proof do not match contract state parameters.
+    InvalidZKPublicInputs = 84,
 }
 
 impl ContractError {
@@ -1098,6 +1102,137 @@ impl TimeLockedUpgradeContract {
         provider: Address,
     ) -> Option<settlement::fees::LiquidityPosition> {
         settlement::fees::get_position(&env, asset, provider)
+    }
+
+    // ── Cross-Border Fiat-Anchor Collateral Ratio Monitor (Issue #991) ──
+    //
+    // Tracks R_anchor = Collateral_locked / Volume_unsettled per
+    // (anchor, corridor) and pauses new remittance assignments to an anchor
+    // whose ratio drops below the corridor minimum (default 120 %). Routing
+    // resumes as soon as the anchor deposits enough additional collateral.
+
+    /// Post additional token collateral for a fiat anchor on a corridor.
+    ///
+    /// Doubles as the recovery path from a pause: once the backing ratio
+    /// reaches the corridor minimum the pause is cleared in the same call.
+    pub fn deposit_anchor_collateral(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralState, ContractError> {
+        settlement::anchor_collateral::deposit_collateral(&env, &caller, &anchor, corridor, amount)
+    }
+
+    /// Release uncommitted collateral back to an anchor.
+    ///
+    /// Rejected when the withdrawal would drop the backing ratio below the
+    /// corridor minimum, which includes every withdrawal while the anchor is
+    /// paused.
+    pub fn withdraw_anchor_collateral(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralState, ContractError> {
+        settlement::anchor_collateral::withdraw_collateral(&env, &caller, &anchor, corridor, amount)
+    }
+
+    /// Assign a new fiat payout to an anchor, appending it to the active
+    /// payout queue.
+    ///
+    /// Fails with [`ContractError::AnchorAssignmentsPaused`] when routing to
+    /// the anchor is already paused, and with
+    /// [`ContractError::AnchorUndercollateralized`] when admitting the payout
+    /// would push the backing ratio below the corridor minimum. The queue is
+    /// left untouched on either rejection path.
+    pub fn assign_anchor_fiat_payout(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::FiatPayoutEntry, ContractError> {
+        settlement::anchor_collateral::assign_fiat_payout(&env, &caller, &anchor, corridor, amount)
+    }
+
+    /// Mark a queued fiat payout as settled off-ledger, consuming the token
+    /// collateral that backed it.
+    pub fn settle_anchor_fiat_payout(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        payout_id: u64,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralState, ContractError> {
+        settlement::anchor_collateral::settle_fiat_payout(
+            &env, &caller, &anchor, corridor, payout_id, amount,
+        )
+    }
+
+    /// Permissionless monitoring tick: re-evaluate an anchor's backing ratio
+    /// and latch or clear its pause flag.
+    pub fn sync_anchor_collateral_ratio(
+        env: Env,
+        anchor: Address,
+        corridor: AssetId,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralStatus, ContractError> {
+        settlement::anchor_collateral::sync_anchor_ratio(&env, &anchor, corridor)
+    }
+
+    /// Read the monitoring snapshot for an anchor on a corridor.
+    pub fn get_anchor_collateral_status(
+        env: Env,
+        anchor: Address,
+        corridor: AssetId,
+    ) -> settlement::anchor_collateral::AnchorCollateralStatus {
+        settlement::anchor_collateral::get_anchor_status(&env, &anchor, corridor)
+    }
+
+    /// Read the active, unsettled fiat payout queue for an anchor.
+    pub fn get_anchor_payout_queue(
+        env: Env,
+        anchor: Address,
+        corridor: AssetId,
+    ) -> Vec<settlement::anchor_collateral::FiatPayoutEntry> {
+        settlement::anchor_collateral::read_payout_queue(&env, &anchor, corridor)
+    }
+
+    /// Governance-configurable minimum backing ratio for a corridor, in basis
+    /// points. Defaults to 120 % and cannot be set below 100 %.
+    pub fn set_anchor_min_collateral_ratio(
+        env: Env,
+        admin: Address,
+        corridor: AssetId,
+        min_ratio_bps: u32,
+    ) -> Result<u32, ContractError> {
+        settlement::anchor_collateral::set_min_collateral_ratio_bps(
+            &env, &admin, corridor, min_ratio_bps,
+        )
+    }
+
+    /// Compute the anchor backing ratio `Collateral_locked / Volume_unsettled`
+    /// in basis points. Saturates at [`u32::MAX`] and returns `0` for an
+    /// empty payout queue, where the ratio is unbounded.
+    pub fn anchor_backing_ratio_bps(collateral_locked: u128, volume_unsettled: u128) -> u32 {
+        settlement::anchor_collateral::backing_ratio_bps(collateral_locked, volume_unsettled)
+    }
+
+    /// `true` when `collateral_locked` backs `volume_unsettled` at
+    /// `min_ratio_bps`. An empty payout queue is always sufficient.
+    pub fn is_anchor_collateral_sufficient(
+        collateral_locked: u128,
+        volume_unsettled: u128,
+        min_ratio_bps: u32,
+    ) -> bool {
+        settlement::anchor_collateral::is_collateral_sufficient(
+            collateral_locked,
+            volume_unsettled,
+            min_ratio_bps,
+        )
     }
 
     /// Record flash loan fee revenue for an asset.
@@ -2559,6 +2694,28 @@ impl TimeLockedUpgradeContract {
         bridge::relayer::remove_validator(&env, &admin, pubkey)
     }
 
+    /// Stake collateral deposit for an active bridge validator (Issue #959).
+    pub fn stake_bridge_validator(
+        env: Env,
+        validator: BytesN<32>,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        bridge::slashing::stake_validator_collateral(&env, &validator, amount)
+    }
+
+    /// Get current staked collateral deposit for a bridge validator (Issue #959).
+    pub fn get_bridge_validator_collateral(env: Env, validator: BytesN<32>) -> i128 {
+        bridge::slashing::get_validator_collateral(&env, &validator)
+    }
+
+    /// Submit cryptographic double-sign proof to slash offending validator 100% and ban permanently (Issue #959).
+    pub fn submit_double_sign_proof(
+        env: Env,
+        proof: bridge::slashing::DoubleSignProof,
+    ) -> Result<i128, ContractError> {
+        bridge::slashing::process_double_sign_proof(&env, &proof)
+    }
+
     // --- Native bridge escrow (Issue #750) ---
 
     pub fn configure_bridge_escrow(
@@ -3211,6 +3368,77 @@ impl TimeLockedUpgradeContract {
         )>,
     ) -> Result<Vec<zk::verifier::VerificationResult>, ContractError> {
         zk::verifier::batch_verify_proofs(&env, &proofs)
+    }
+
+    // ── Timelocked ZK Verification Key Rotation (Issue #931) ──────────────
+
+    /// Queue a governance-timelocked rotation of a circuit's ZK verification
+    /// key. The new verification key and its proving key are validated
+    /// structurally before the proposal is persisted. Returns the version
+    /// identifier assigned to the queued update.
+    pub fn queue_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        vkey: zk::verifier::VerificationKey,
+        proving_key: zk::proving_key::UploadedProvingKey,
+        schema: zk::proving_key::ProvingKeySchema,
+    ) -> Result<u32, ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        let update = zk::key_update::queue_verification_key_update(
+            &env,
+            caller,
+            vkey,
+            proving_key,
+            schema,
+        )?;
+        Ok(update.version)
+    }
+
+    /// Execute a queued ZK verification-key rotation once its governance
+    /// timelock has elapsed. Re-validates structural integrity, commits the
+    /// key, and emits `ZKVerificationKeysUpdated` with the version identifier.
+    pub fn execute_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        circuit_id: BytesN<32>,
+    ) -> Result<u32, ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        zk::key_update::execute_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Cancel a pending (queued but unexecuted) ZK verification-key rotation.
+    pub fn cancel_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        circuit_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        zk::key_update::cancel_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Read the pending ZK verification-key rotation for a circuit, if any.
+    pub fn get_pending_zk_verification_key_update(
+        env: Env,
+        circuit_id: BytesN<32>,
+    ) -> Option<zk::key_update::ZKVerificationKeyUpdate> {
+        zk::key_update::get_pending_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Read the latest committed ZK verification-key version for a circuit.
+    pub fn get_zk_verification_key_version(env: Env, circuit_id: BytesN<32>) -> u32 {
+        zk::key_update::get_verification_key_version(&env, &circuit_id)
     }
 
 #[cfg(test)]
