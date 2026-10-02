@@ -812,6 +812,9 @@ impl TimeLockedUpgradeContract {
         let data = Self::get_data(env.clone())?;
         if data.admin != proposer { return Err(ContractError::NotAdmin); }
         proposer.require_auth();
+        if veto::is_hash_vetoed(&env, &new_wasm_hash) {
+            return Err(ContractError::ProposalAlreadyVetoed);
+        }
         consume_nonce(&env, &proposer, nonce, salt, salt_signature)?;
 
         // Verify multi-sig quorum threshold
@@ -865,6 +868,9 @@ impl TimeLockedUpgradeContract {
         executor.require_auth();
         consume_nonce(&env, &executor, nonce, salt, signature)?;
         let pending: StagedUpgrade = env.storage().instance().get(&PENDING_UPGRADE_KEY).ok_or(ContractError::NoPendingUpgrade)?;
+        if veto::is_hash_vetoed(&env, &pending.new_wasm_hash) {
+            return Err(ContractError::ProposalAlreadyVetoed);
+        }
         if !verify_staged_delay(pending.staged_at, env.ledger().sequence()) {
             return Err(ContractError::UpgradeTimelockNotSatisfied);
         }
@@ -1949,19 +1955,19 @@ impl TimeLockedUpgradeContract {
         veto::get_security_council(&env)
     }
 
-    /// Veto an active proposal, instantly transitioning it to `Vetoed` state.
+    /// Veto a queued governance proposal during its timelock.
     ///
     /// Only the designated Security Council may invoke this function. Upon veto:
-    /// 1. The proposal is marked as vetoed
+    /// 1. The queued proposal is removed and its hash is rejected on re-submission
     /// 2. Execution payload is invalidated
-    /// 3. Audit trail is recorded with reason hash
+    /// 3. Audit trail is recorded with the reason string
     /// 4. `ProposalVetoed` event is emitted
     ///
     /// # Arguments
     /// * `env` - The contract environment
     /// * `caller` - The address attempting the veto (must be Security Council)
     /// * `proposal_id` - The ID of the proposal to veto
-    /// * `reason` - Audit reason string (logged as hash for transparency)
+    /// * `reason` - Audit reason string
     ///
     /// # Errors
     /// - [`ContractError::NotSecurityCouncil`] if the caller is not the Security Council
