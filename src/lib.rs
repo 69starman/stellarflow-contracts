@@ -1082,6 +1082,137 @@ impl TimeLockedUpgradeContract {
         settlement::fees::get_position(&env, asset, provider)
     }
 
+    // ── Cross-Border Fiat-Anchor Collateral Ratio Monitor (Issue #991) ──
+    //
+    // Tracks R_anchor = Collateral_locked / Volume_unsettled per
+    // (anchor, corridor) and pauses new remittance assignments to an anchor
+    // whose ratio drops below the corridor minimum (default 120 %). Routing
+    // resumes as soon as the anchor deposits enough additional collateral.
+
+    /// Post additional token collateral for a fiat anchor on a corridor.
+    ///
+    /// Doubles as the recovery path from a pause: once the backing ratio
+    /// reaches the corridor minimum the pause is cleared in the same call.
+    pub fn deposit_anchor_collateral(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralState, ContractError> {
+        settlement::anchor_collateral::deposit_collateral(&env, &caller, &anchor, corridor, amount)
+    }
+
+    /// Release uncommitted collateral back to an anchor.
+    ///
+    /// Rejected when the withdrawal would drop the backing ratio below the
+    /// corridor minimum, which includes every withdrawal while the anchor is
+    /// paused.
+    pub fn withdraw_anchor_collateral(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralState, ContractError> {
+        settlement::anchor_collateral::withdraw_collateral(&env, &caller, &anchor, corridor, amount)
+    }
+
+    /// Assign a new fiat payout to an anchor, appending it to the active
+    /// payout queue.
+    ///
+    /// Fails with [`ContractError::AnchorAssignmentsPaused`] when routing to
+    /// the anchor is already paused, and with
+    /// [`ContractError::AnchorUndercollateralized`] when admitting the payout
+    /// would push the backing ratio below the corridor minimum. The queue is
+    /// left untouched on either rejection path.
+    pub fn assign_anchor_fiat_payout(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::FiatPayoutEntry, ContractError> {
+        settlement::anchor_collateral::assign_fiat_payout(&env, &caller, &anchor, corridor, amount)
+    }
+
+    /// Mark a queued fiat payout as settled off-ledger, consuming the token
+    /// collateral that backed it.
+    pub fn settle_anchor_fiat_payout(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        payout_id: u64,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralState, ContractError> {
+        settlement::anchor_collateral::settle_fiat_payout(
+            &env, &caller, &anchor, corridor, payout_id, amount,
+        )
+    }
+
+    /// Permissionless monitoring tick: re-evaluate an anchor's backing ratio
+    /// and latch or clear its pause flag.
+    pub fn sync_anchor_collateral_ratio(
+        env: Env,
+        anchor: Address,
+        corridor: AssetId,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralStatus, ContractError> {
+        settlement::anchor_collateral::sync_anchor_ratio(&env, &anchor, corridor)
+    }
+
+    /// Read the monitoring snapshot for an anchor on a corridor.
+    pub fn get_anchor_collateral_status(
+        env: Env,
+        anchor: Address,
+        corridor: AssetId,
+    ) -> settlement::anchor_collateral::AnchorCollateralStatus {
+        settlement::anchor_collateral::get_anchor_status(&env, &anchor, corridor)
+    }
+
+    /// Read the active, unsettled fiat payout queue for an anchor.
+    pub fn get_anchor_payout_queue(
+        env: Env,
+        anchor: Address,
+        corridor: AssetId,
+    ) -> Vec<settlement::anchor_collateral::FiatPayoutEntry> {
+        settlement::anchor_collateral::read_payout_queue(&env, &anchor, corridor)
+    }
+
+    /// Governance-configurable minimum backing ratio for a corridor, in basis
+    /// points. Defaults to 120 % and cannot be set below 100 %.
+    pub fn set_anchor_min_collateral_ratio(
+        env: Env,
+        admin: Address,
+        corridor: AssetId,
+        min_ratio_bps: u32,
+    ) -> Result<u32, ContractError> {
+        settlement::anchor_collateral::set_min_collateral_ratio_bps(
+            &env, &admin, corridor, min_ratio_bps,
+        )
+    }
+
+    /// Compute the anchor backing ratio `Collateral_locked / Volume_unsettled`
+    /// in basis points. Saturates at [`u32::MAX`] and returns `0` for an
+    /// empty payout queue, where the ratio is unbounded.
+    pub fn anchor_backing_ratio_bps(collateral_locked: u128, volume_unsettled: u128) -> u32 {
+        settlement::anchor_collateral::backing_ratio_bps(collateral_locked, volume_unsettled)
+    }
+
+    /// `true` when `collateral_locked` backs `volume_unsettled` at
+    /// `min_ratio_bps`. An empty payout queue is always sufficient.
+    pub fn is_anchor_collateral_sufficient(
+        collateral_locked: u128,
+        volume_unsettled: u128,
+        min_ratio_bps: u32,
+    ) -> bool {
+        settlement::anchor_collateral::is_collateral_sufficient(
+            collateral_locked,
+            volume_unsettled,
+            min_ratio_bps,
+        )
+    }
+
     /// Record flash loan fee revenue for an asset.
     pub fn record_flash_fee(
         env: Env,
