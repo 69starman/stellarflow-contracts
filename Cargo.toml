@@ -20,8 +20,12 @@ members = [
     "contracts/shielded-remittance-escrow",
     "contracts/strategy-migrator",
     "contracts/gas-tank",
+    "contracts/governance_executer",
     "contracts/vault-health-monitor",
+    "contracts/vault-liquidation-inspector",
     "contracts/multisig-weight-guard",
+    "contracts/yield-unwind",
+    "contracts/multisig-admin-rotation",
 ]
 # tests/fuzz/fuzz/ is the cargo-fuzz coverage-guided target subcrate.
 # It depends on libfuzzer-sys, which only builds on nightly Rust, so it
