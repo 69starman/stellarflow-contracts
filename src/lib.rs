@@ -2210,6 +2210,36 @@ impl TimeLockedUpgradeContract {
         )
     }
 
+    /// Atomically liquidate a distressed vault position using a flash loan.
+    ///
+    /// This entrypoint implements the full atomic liquidation sequence for
+    /// issue #1023:
+    ///
+    /// 1. **Validate** — confirm the vault is below the liquidation threshold.
+    /// 2. **Borrow** — record flash loan obligation (principal + fee).
+    /// 3. **Repay vault debt** — seize proportional collateral plus the 5%
+    ///    liquidator bonus from the distressed vault.
+    /// 4. **Swap collateral** — exchange seized collateral back to the debt
+    ///    asset via the AMM/DEX router specified in `params`.
+    /// 5. **Repay flash loan** — settle principal + fee with the lender within
+    ///    the same transaction frame.
+    /// 6. **Health check** — verify the vault's post-liquidation health factor
+    ///    is above `params.min_health_factor_bps` (defaults to 110%).
+    ///
+    /// Returns [`ContractError::FlashLiquidationHealthCheckFailed`] if the
+    /// vault is healthy or fails to recover after liquidation, and
+    /// [`ContractError::FlashLiquidationInsufficientRepay`] if collateral
+    /// proceeds do not cover the flash loan principal + fee.
+    ///
+    /// Closes #1023.
+    pub fn flash_loan_liquidate(
+        env: Env,
+        position: vaults::liquidation::VaultPosition,
+        params: vaults::liquidation::FlashLoanLiquidationParams,
+    ) -> Result<vaults::liquidation::FlashLoanLiquidationResult, ContractError> {
+        vaults::liquidation::flash_loan_liquidate(&env, &position, &params)
+    }
+
     pub fn vault_config(env: Env) -> Option<vaults::autocompound::VaultConfig> {
         vaults::autocompound::get_config(&env)
     }
