@@ -311,6 +311,28 @@ impl ContractError {
     pub const HarvestSlippageExceeded: Self = Self::SlippageExceeded;
     pub const HarvestInvalidPath: Self = Self::InconsistentRouteAssets;
 
+    // ── Auto-compounding yield drawdown guard (Issue #1010) ────────────────
+    // Semantic aliases only, matching the `Harvest*` convention above. No new
+    // `#[contracterror]` variants are introduced: that enum is already at 82
+    // cases against the soroban-sdk 20 cap of 50, so every new error here is
+    // expressed as an alias rather than widening the enum.
+    /// Auto-compounding harvest is paused because the reward token breached
+    /// its drawdown limit.
+    pub const YieldCompoundingPaused: Self = Self::ContractPaused;
+    /// A price observation or a 7-day reference price was not strictly
+    /// positive, so the price trend is undefined.
+    pub const YieldPriceNotPositive: Self = Self::InvalidArgument;
+    /// A price observation preceded the newest retained sample, which would
+    /// allow the reference price to be rewound.
+    pub const YieldStalePriceSample: Self = Self::StaleSequence;
+    /// A configured drawdown limit fell outside its permitted bounds.
+    pub const YieldInvalidDrawdownLimit: Self = Self::InvalidVarianceConfig;
+    /// A reserve-conversion route did not run reward token to base reserve, or
+    /// its length was out of bounds.
+    pub const YieldInvalidConversionPath: Self = Self::InconsistentRouteAssets;
+    /// The router delivered no base reserve at all.
+    pub const YieldConversionProducedNothing: Self = Self::AmountTooLow;
+
     // ── Issue #720 canonical API error aliases ────────────────────────────────
     // These four names are the stable external-facing identifiers documented in
     // the public ABI. Client SDKs SHOULD match against these variants by name.
@@ -2113,6 +2135,141 @@ impl TimeLockedUpgradeContract {
     ) -> Result<vaults::harvest_compound::HarvestCompoundResult, ContractError> {
         let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
         vaults::harvest_compound::harvest_and_compound(&env, user, router, path, min_lp_out)
+    }
+
+    // ── Auto-compounding yield drawdown guard (Issue #1010) ─────────────────
+    //
+    // Tracks ΔP = (P_current - P_7d) / P_7d for each vault's target reward
+    // token and pauses auto-compounding harvest past the corridor drawdown
+    // limit (default 20 %), directing the strategy to convert accrued rewards
+    // into the base stablecoin reserve instead of re-investing them.
+
+    /// Configure a vault's drawdown guard.
+    pub fn configure_compounding_guard(
+        env: Env,
+        admin: Address,
+        vault: AssetId,
+        reward_token: Address,
+        base_reserve: Address,
+        max_drawdown_bps: i64,
+        window_secs: u64,
+    ) -> Result<vaults::compounding_guard::CompoundingGuardConfig, ContractError> {
+        vaults::compounding_guard::configure_guard(
+            &env,
+            &admin,
+            vault,
+            reward_token,
+            base_reserve,
+            max_drawdown_bps,
+            window_secs,
+        )
+    }
+
+    /// Update only the drawdown limit of an existing guard.
+    pub fn set_yield_max_drawdown_bps(
+        env: Env,
+        admin: Address,
+        vault: AssetId,
+        max_drawdown_bps: i64,
+    ) -> Result<vaults::compounding_guard::CompoundingGuardConfig, ContractError> {
+        vaults::compounding_guard::set_max_drawdown_bps(&env, &admin, vault, max_drawdown_bps)
+    }
+
+    /// Record a reward-token price observation and re-evaluate the guard.
+    pub fn record_yield_price_sample(
+        env: Env,
+        keeper: Address,
+        vault: AssetId,
+        price: i128,
+    ) -> Result<vaults::compounding_guard::DrawdownStatus, ContractError> {
+        vaults::compounding_guard::record_price_sample(&env, &keeper, vault, price)
+    }
+
+    /// Permissionless monitoring tick: re-evaluate the trend and latch or clear
+    /// the auto-compounding pause.
+    pub fn sync_yield_drawdown(
+        env: Env,
+        vault: AssetId,
+    ) -> Result<vaults::compounding_guard::DrawdownStatus, ContractError> {
+        vaults::compounding_guard::sync_drawdown(&env, vault)
+    }
+
+    /// Read the drawdown monitoring snapshot for a vault.
+    pub fn get_yield_drawdown_status(
+        env: Env,
+        vault: AssetId,
+    ) -> Result<vaults::compounding_guard::DrawdownStatus, ContractError> {
+        vaults::compounding_guard::drawdown_status(&env, vault)
+    }
+
+    /// `true` when auto-compounding harvest is paused for a vault.
+    pub fn is_yield_compounding_paused(env: Env, vault: AssetId) -> bool {
+        vaults::compounding_guard::is_auto_compounding_paused(&env, vault)
+    }
+
+    /// What the auto-compounding strategy should do with accrued rewards:
+    /// re-invest, convert to base reserves, or hold.
+    pub fn yield_compounding_action(
+        env: Env,
+        vault: AssetId,
+    ) -> vaults::compounding_guard::CompoundingAction {
+        vaults::compounding_guard::strategy_action(&env, vault)
+    }
+
+    /// Convert accrued rewards into the base stablecoin reserve instead of
+    /// re-investing them. Callable while the guard is tripped, which is exactly
+    /// when it is needed.
+    pub fn convert_yield_to_reserves(
+        env: Env,
+        keeper: Address,
+        router: Address,
+        vault: AssetId,
+        path: Vec<Address>,
+        reward_amount: i128,
+        min_reserve_out: i128,
+    ) -> Result<vaults::compounding_guard::ReserveConversion, ContractError> {
+        let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
+        vaults::compounding_guard::convert_rewards_to_reserves(
+            &env,
+            &keeper,
+            router,
+            vault,
+            path,
+            reward_amount,
+            min_reserve_out,
+        )
+    }
+
+    /// Read the base-reserve balance booked through conversions.
+    pub fn yield_reserve_accrued(env: Env, vault: AssetId) -> i128 {
+        vaults::compounding_guard::reserve_accrued(&env, vault)
+    }
+
+    /// Sweep booked base reserves out of the vault.
+    pub fn sweep_yield_reserves(
+        env: Env,
+        admin: Address,
+        to: Address,
+        vault: AssetId,
+        amount: i128,
+    ) -> Result<i128, ContractError> {
+        vaults::compounding_guard::sweep_reserves(&env, &admin, to, vault, amount)
+    }
+
+    /// Compute the signed price trend `(P_current - P_7d) / P_7d` in basis
+    /// points. Positive means appreciation.
+    pub fn yield_price_trend_bps(current: i128, reference: i128) -> Result<i64, ContractError> {
+        vaults::compounding_guard::price_trend_bps(current, reference)
+    }
+
+    /// `true` when the reward token has depreciated by strictly more than
+    /// `max_drawdown_bps` between `reference` and `current`.
+    pub fn is_yield_drawdown_exceeded(
+        current: i128,
+        reference: i128,
+        max_drawdown_bps: i64,
+    ) -> bool {
+        vaults::compounding_guard::is_drawdown_exceeded(current, reference, max_drawdown_bps)
     }
 
     // ── On-chain limit order book (Issue #701) ───────────────────────────────
