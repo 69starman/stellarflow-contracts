@@ -48,6 +48,8 @@ pub enum Role {
     BoundsAdjuster,
     /// May manage the set of tracked assets and oracle configuration.
     OracleManager,
+    /// Verified coordinator node that may trigger the circuit-breaker.
+    Coordinator,
 }
 
 /// Storage keys local to the role registry. Kept in this module so the

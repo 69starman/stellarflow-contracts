@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, panic_with_error, token, Address, Env, String, Vec,
+    contract, contracterror, contractimpl, panic_with_error, symbol_short, token, Address, Env,
+    String, Symbol, Vec,
 };
 
 #[derive(Clone)]
@@ -37,7 +38,7 @@ pub struct CooldownAction {
 pub struct CooldownStage {
     pub stage_number: u32,
     pub cooldown_seconds: u64,
-    pub description: soroban_sdk::String,
+    pub description: Symbol,
 }
 
 #[derive(Clone)]
@@ -100,9 +101,7 @@ impl RewardSplitter {
             .instance()
             .set(&DataKey::Recipients, &Vec::<Recipient>::new(&env));
         env.storage().instance().set(&DataKey::TotalShares, &0u32);
-        env.storage()
-            .instance()
-            .set(&DataKey::Initialized, &true);
+        env.storage().instance().set(&DataKey::Initialized, &true);
 
         // Initialize default cooldown stages
         Self::initialize_default_cooldown_stages(&env);
@@ -113,17 +112,17 @@ impl RewardSplitter {
         let stage1 = CooldownStage {
             stage_number: 1,
             cooldown_seconds: STAGE_1_COOLDOWN,
-            description: String::from_str(env, "Initial proposal stage - 1 hour cooldown"),
+            description: symbol_short!("INIT"),
         };
         let stage2 = CooldownStage {
             stage_number: 2,
             cooldown_seconds: STAGE_2_COOLDOWN,
-            description: String::from_str(env, "Review stage - 8 hour cooldown"),
+            description: symbol_short!("REVIEW"),
         };
         let stage3 = CooldownStage {
             stage_number: 3,
             cooldown_seconds: STAGE_3_COOLDOWN,
-            description: String::from_str(env, "Final approval stage - 24 hour cooldown"),
+            description: symbol_short!("APPROVE"),
         };
 
         env.storage()
@@ -173,7 +172,9 @@ impl RewardSplitter {
         env.storage()
             .instance()
             .set(&DataKey::Recipients, &recipients);
-        env.storage().instance().set(&DataKey::TotalShares, &total_shares);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &total_shares);
     }
 
     /// Remove a recipient
@@ -211,7 +212,9 @@ impl RewardSplitter {
         env.storage()
             .instance()
             .set(&DataKey::Recipients, &new_recipients);
-        env.storage().instance().set(&DataKey::TotalShares, &total_shares);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &total_shares);
     }
 
     /// Update a recipient's share
@@ -271,7 +274,9 @@ impl RewardSplitter {
         env.storage()
             .instance()
             .set(&DataKey::Recipients, &new_recipients);
-        env.storage().instance().set(&DataKey::TotalShares, &new_total);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &new_total);
     }
 
     /// Distribute tokens to all recipients according to their fixed shares
@@ -343,18 +348,12 @@ impl RewardSplitter {
 
     /// Get admin address
     pub fn get_admin(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap()
+        env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
     /// Get token address
     pub fn get_token(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DataKey::Token)
-            .unwrap()
+        env.storage().instance().get(&DataKey::Token).unwrap()
     }
 
     /// Transfer admin to a new address
@@ -384,8 +383,12 @@ impl RewardSplitter {
             .get(&DataKey::DefaultToken)
             .unwrap();
 
-        env.storage().instance().set(&DataKey::Admin, &default_admin);
-        env.storage().instance().set(&DataKey::Token, &default_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &default_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Token, &default_token);
         env.storage()
             .instance()
             .set(&DataKey::Recipients, &Vec::<Recipient>::new(&env));
@@ -411,11 +414,7 @@ impl RewardSplitter {
     /// Helper function to require admin authorization
     fn require_admin(env: &Env, admin: &Address) {
         admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if stored_admin != *admin {
             panic_with_error!(env, Error::Unauthorized);
         }
@@ -604,7 +603,7 @@ impl RewardSplitter {
         admin: Address,
         stage_number: u32,
         cooldown_seconds: u64,
-        description: String,
+        description: Symbol,
     ) {
         Self::require_admin(&env, &admin);
 
@@ -643,8 +642,12 @@ impl RewardSplitter {
             .get(&DataKey::DefaultToken)
             .unwrap();
 
-        env.storage().instance().set(&DataKey::Admin, &default_admin);
-        env.storage().instance().set(&DataKey::Token, &default_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &default_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Token, &default_token);
         env.storage()
             .instance()
             .set(&DataKey::Recipients, &Vec::<Recipient>::new(env));
