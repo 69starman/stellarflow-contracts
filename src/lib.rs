@@ -279,6 +279,26 @@ impl ContractError {
     pub const BridgeSupplyCapExceeded: Self = Self::Overflow;
     pub const BridgeInsufficientBalance: Self = Self::Overflow;
     pub const BridgeEscrowNotConfigured: Self = Self::NotInitialized;
+
+    // ── Bridge wrapped supply cap guard (Issue #1009) ─────────────────────
+    // Semantic aliases only, matching the `Bridge*` and `Harvest*` conventions
+    // above. No new `#[contracterror]` variants: that enum is already at 82
+    // cases against the soroban-sdk 20 cap of 50, so each new error is an alias
+    // rather than another variant.
+    /// A mint would push wrapped supply past the collateral-backed cap.
+    pub const BridgeCapExceeded: Self = Self::InsufficientReserveBalance;
+    /// Verified locked collateral is insufficient to cover the active wrapped
+    /// supply, or is smaller than a requested release.
+    pub const BridgeCapUndercollateralized: Self = Self::InsufficientReserveBalance;
+    /// A release or reconciliation asked for more than is recorded.
+    pub const BridgeCapInsufficientCollateral: Self = Self::InsufficientReserveBalance;
+    /// A locked-collateral figure was negative, which is not an observation.
+    pub const BridgeCapInvalidCollateral: Self = Self::InvalidArgument;
+    /// A configured capacity ratio fell outside its permitted bounds.
+    pub const BridgeCapInvalidConfig: Self = Self::InvalidVarianceConfig;
+    /// A supply delta, release amount or observed total was not strictly
+    /// positive, or reconciliation tried to lower the mirrored supply.
+    pub const BridgeCapInvalidAmount: Self = Self::AmountTooLow;
     pub const AdminChangeTimelockNotSatis: Self = Self::UpgradeTimelockNotSatisfied;
     pub const StagingNotAuthorized: Self = Self::Unauthorized;
     pub const EmptyRoute: Self = Self::AmountTooLow;
